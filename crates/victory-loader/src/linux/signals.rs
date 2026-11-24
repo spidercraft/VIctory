@@ -363,6 +363,14 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
     {
         return;
     }
+    // Console CPUs are Zen 2: emulate AMD-only instructions (clzero,
+    // monitorx/mwaitx, clwb, SSE4a) that Intel CPUs lack.
+    if signal == libc::SIGILL && si.si_code > 0 && trap == 6 {
+        // SAFETY: `uc` is the kernel's `ucontext_t` for this hardware `#UD`.
+        if unsafe { super::emulate::emulate_amd_only(uc) } {
+            return;
+        }
+    }
     let fault = Fault {
         signal,
         si_code: si.si_code,

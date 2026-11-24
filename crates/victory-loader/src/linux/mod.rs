@@ -13,6 +13,7 @@
 
 mod asm;
 pub mod context;
+mod emulate;
 pub mod image;
 pub mod seh;
 pub mod signals;
