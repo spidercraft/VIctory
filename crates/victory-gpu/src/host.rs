@@ -242,11 +242,6 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         tracing::info!("host D3D12 device ready");
-        // DXC's first compile, while nothing is guarded yet (see there).
-        #[cfg(not(windows))]
-        if std::env::var_os("VICTORY_DXCOMPILER").is_some() {
-            let _ = crate::indirect::compiled();
-        }
         Ok(Host {
             device,
             queue,

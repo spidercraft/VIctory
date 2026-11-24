@@ -62,20 +62,6 @@ fn ours() -> libc::sigaction {
     action
 }
 
-/// Puts our handler back where a library replaced it: DXC's LLVM installs
-/// its own (`SA_RESETHAND`) at its first compile, after which the next
-/// fault in title code, or write to a block the GPU side guards, ended the
-/// process. What was there before ours stays the fallback.
-pub fn reclaim() {
-    if !INSTALL.is_completed() {
-        return;
-    }
-    for &signal in &SIGNALS {
-        // SAFETY: our action, as `install` set it.
-        unsafe { libc::sigaction(signal, &ours(), std::ptr::null_mut()) };
-    }
-}
-
 /// Gives the calling thread a 64 KiB alternate signal stack unless it has
 /// one that large (std gives its threads a smaller one), freed when the
 /// thread ends. Guest threads

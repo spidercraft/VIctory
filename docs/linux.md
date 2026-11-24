@@ -115,8 +115,7 @@ translator stay shared.
   `victory_gpu::kernel_will_write` first (the file layer and UCRT reads,
   DirectStorage), and writes into the physical pool outside the views call
   `vm::pool_written`.
-- **Not yet:** the DXIL validator and the indirect argument clamp's compiler by default
-  (below), fence events until the handle table registers its `SetEvent`
+- **Not yet:** the DXIL validator by default (below), fence events until the handle table registers its `SetEvent`
   (`victory_gpu::fence::on_set_event`), the debug layer and WARP.
 
 Building vkd3d-proton (meson, ninja, glslang; Vulkan headers come with
@@ -135,18 +134,17 @@ libraries); Arch's `vkd3d` is upstream vkd3d, a different library.
 vkd3d-proton writes `vkd3d-proton.cache` into the working directory
 (`VKD3D_SHADER_CACHE_PATH` moves it).
 
-DXC is optional and opt-in on Linux: `VICTORY_DXIL` names `libdxil.so`
-for `victory translate --validate`, `VICTORY_DXCOMPILER` names
-`libdxcompiler.so` for the indirect argument clamp (without it indirect
-execution is dropped, as when the clamp fails on Windows). Arch's
-`directx-shader-compiler` 1.10.2605 asserts on every shader it compiles
-and its validator traps on some of ours, so neither is loaded unasked.
-Microsoft's own Linux release works (tested: v1.9.2609):
+DXC's validator is optional and opt-in on Linux: `VICTORY_DXIL` names
+`libdxil.so` for `victory translate --validate`. Arch's
+`directx-shader-compiler` 1.10.2605 validator traps on some of our
+shaders, so it is not loaded unasked. Microsoft's own Linux release works
+(tested: v1.9.2609). Nothing needs an HLSL compiler: the indirect argument
+clamp is built by our own emitter.
 
 ```sh
 gh release download v1.9.2609 -R microsoft/DirectXShaderCompiler -p 'linux_dxc_*.tar.gz'
 mkdir -p ~/.local/dxc && tar xzf linux_dxc_*.tar.gz -C ~/.local/dxc
-export VICTORY_DXIL=~/.local/dxc/lib/libdxil.so VICTORY_DXCOMPILER=~/.local/dxc/lib/libdxcompiler.so
+export VICTORY_DXIL=~/.local/dxc/lib/libdxil.so
 ```
 
 Tests with a device: `VICTORY_VKD3D=... cargo test -p victory-shader

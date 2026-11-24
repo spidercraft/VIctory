@@ -3,13 +3,13 @@
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside. On
-//! Linux DXC compiles it, as 6.0, if `VICTORY_DXCOMPILER` names one).
+//! just before its execution, by a compute shader of ours
+//! (`victory_shader::emit::clamp`, built as the translations are: no HLSL
+//! compiler on any host).
 //!
-//! Each list also has a budget (2^27 vertex instances or threads, groups
-//! counted as 64 threads, mesh groups as 128): records past it run empty,
-//! so a list of thousands of garbage records cannot run for seconds
+//! Each list also has a budget ([`LIMITS`]: vertex instances or threads,
+//! groups counted as 64 threads, mesh groups as 128): records past it run
+//! empty, so a list of thousands of garbage records cannot run for seconds
 //! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
@@ -17,61 +17,21 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use victory_shader::emit::clamp::{self, Limits};
+use victory_shader::emit::{ROOT_CBV_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D12::*;
-#[cfg(windows)]
-use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
-// Groups of one dispatch; more run empty.
-static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= records) return;
-    uint at = id.x * stride;
-    uint cost;
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        args.Store2(at, uint2(count, instances));
-    } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
-    }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
-    }
-}
-"#;
+const LIMITS: Limits = Limits {
+    vertices: 1 << 24,
+    vertex_instances: 1 << 26,
+    groups_per_dimension: 65535,
+    groups: 1 << 20,
+    group_cost: 64,
+    mesh_group_cost: 128,
+    budget: 1 << 27,
+};
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -83,7 +43,7 @@ unsafe impl Send for Clamp {}
 // SAFETY: as above.
 unsafe impl Sync for Clamp {}
 
-fn clamp() -> Option<&'static Clamp> {
+fn pipeline() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
         .get_or_init(|| match make() {
@@ -96,77 +56,50 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-/// The clamp's DXIL, with its root signature, compiled once. DXC's LLVM
-/// replaces our fault handlers at its first compile (it registers its own
-/// once per process), so they are taken back right after; the device's
-/// creation compiles it, before any copy guards title memory.
-#[cfg(not(windows))]
-pub(crate) fn compiled() -> windows::core::Result<Vec<u8>> {
-    static DXIL: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-    DXIL.get_or_init(|| {
-        let dxil = victory_shader::hostlib::compile_hlsl(SOURCE, "main", "cs_6_0");
-        victory_loader::linux::signals::reclaim();
-        dxil.inspect_err(|e| tracing::warn!("argument clamp: {e}")).ok()
-    })
-    .clone()
-    .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
-}
-
-/// The clamp's DXBC, with its root signature.
-#[cfg(windows)]
-fn compiled() -> windows::core::Result<Vec<u8>> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes.
-    Ok(unsafe {
-        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-    }
-    .to_vec())
-}
-
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let bytes = &compiled()?[..];
-    // SAFETY: the root signature is inside the shader.
-    unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    let uav = |slot: u8| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    // In the order `bound` sets them: the constants, then the buffers at
+    // the root parameter indices the shader names.
+    let params = [
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: 4,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        uav(clamp::ARGUMENTS),
+        uav(clamp::BUDGET),
+    ];
+    let (root, _) = crate::pipeline::host::root_signature(device, &params, &[], true)?;
+    let bytes = clamp::argument_clamp(&LIMITS);
+    // SAFETY: the description points at live data.
+    let pso = unsafe {
+        device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: bytes.as_ptr().cast(),
                 BytecodeLength: bytes.len(),
             },
             ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
-    }
+        })?
+    };
+    Ok(Clamp { root, pso })
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
@@ -180,7 +113,7 @@ pub(crate) fn bound(
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+    let (Some(c), Some(budget)) = (pipeline(), list.budget()) else {
         return false;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
@@ -196,9 +129,9 @@ pub(crate) fn bound(
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
-        l.SetComputeRootUnorderedAccessView(2, budget);
-        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.SetComputeRootUnorderedAccessView(clamp::ARGUMENTS.into(), gpu);
+        l.SetComputeRootUnorderedAccessView(clamp::BUDGET.into(), budget);
+        l.Dispatch(records.div_ceil(clamp::GROUP), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
@@ -236,30 +169,85 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
-    /// The clamp compiles with the system's compiler and the host takes it.
+    use victory_shader::emit::clamp::{DISPATCH, DRAW, DRAW_INDEXED, MESH, clamped};
+
+    use super::*;
+
+    /// Runs the clamp over `records` (three dwords each, `stride` bytes
+    /// apart) in a list of its own and returns them; None without a host.
+    fn run(kind: u32, stride: u32, records: &[[u32; 3]]) -> Option<Vec<[u32; 3]>> {
+        let host = host()?;
+        let step = (stride / 4) as usize;
+        let (buffer, data) = host.shared_buffer(u64::from(stride) * records.len() as u64)?;
+        // SAFETY: the buffer's own mapped dwords, `step` to a record.
+        let dwords = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), step * records.len()) };
+        // Dwords past the third are the record's other arguments: untouched.
+        dwords.fill(0xdead_beef);
+        for (to, from) in dwords.chunks_mut(step).zip(records) {
+            to[..3].copy_from_slice(from);
+        }
+        let list = host.new_list().unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        assert!(bound(&list, &buffer, gpu, (kind, stride, records.len() as u32)));
+        done(&list, &buffer);
+        list.close();
+        host.execute(&[&list]);
+        assert!(dwords.chunks(step).all(|r| r[3..].iter().all(|&d| d == 0xdead_beef)));
+        Some(dwords.chunks(step).map(|r| [r[0], r[1], r[2]]).collect())
+    }
+
+    /// The host takes the shader we build and runs it as the arithmetic in
+    /// `clamped` says, for every kind of record.
     #[test]
-    fn argument_clamp_builds() {
-        if super::host().is_none() {
-            return; // no host GPU here
-        }
-        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
-            return; // no HLSL compiler named
-        }
-        #[cfg(not(windows))]
-        let handler = || {
-            victory_loader::linux::signals::install();
-            // SAFETY: a query into a zeroed action of ours.
-            unsafe {
-                let mut action: libc::sigaction = std::mem::zeroed();
-                libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut action);
-                action.sa_sigaction
+    fn the_host_clamps_as_the_model_does() {
+        const BIG: u32 = u32::MAX;
+        let cases: [(u32, u32, &[[u32; 3]]); 4] = [
+            (DRAW, 16, &[[3, 1, 7], [BIG, 1, 7], [6, 1000, 7], [0, BIG, 7], [1 << 24, 5, 7]]),
+            (DRAW_INDEXED, 20, &[[36, 2, 9], [BIG, BIG, 9], [0, 0, 9]]),
+            (
+                DISPATCH,
+                12,
+                &[[8, 8, 1], [BIG, 1, 1], [1024, 1024, 1], [1024, 1025, 1], [2, 2, BIG], [5, 0, 5], [1, 1, 0]],
+            ),
+            (MESH, 12, &[[40, 1, 1], [BIG, BIG, BIG], [9, 0, 1], [0, 1, 1]]),
+        ];
+        for (kind, stride, records) in cases {
+            // Under the budget together, so the order the threads ran in
+            // does not show.
+            let spent: u64 = records.iter().map(|&r| u64::from(clamped(&LIMITS, kind, r, 0).1)).sum();
+            assert!(spent <= u64::from(LIMITS.budget));
+            let Some(got) = run(kind, stride, records) else {
+                eprintln!("no host D3D12 device; skipped");
+                return;
+            };
+            for (i, (&record, got)) in records.iter().zip(got).enumerate() {
+                let want = clamped(&LIMITS, kind, record, 0).0;
+                assert_eq!(got, want, "kind {kind} record {i} {record:x?}");
             }
+        }
+        // More records than one thread group, with their own values.
+        let many: Vec<[u32; 3]> = (0..200).map(|i| [i, i % 7, BIG - i]).collect();
+        let got = run(DRAW, 16, &many).unwrap();
+        for (&record, got) in many.iter().zip(got) {
+            assert_eq!(got, clamped(&LIMITS, DRAW, record, 0).0);
+        }
+    }
+
+    /// Records past the list's budget run empty: a draw keeps its layout
+    /// with no vertices.
+    #[test]
+    fn records_past_the_budget_run_empty() {
+        // Each draw clamps to the most one may ask for; two fill the budget.
+        let most = LIMITS.vertex_instances;
+        assert_eq!(LIMITS.budget, 2 * most);
+        let Some(got) = run(DRAW, 16, &[[1 << 24, u32::MAX, 0]; 6]) else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
         };
-        #[cfg(not(windows))]
-        let ours = handler();
-        assert!(super::clamp().is_some());
-        // DXC's LLVM took the fault handler at its first compile; ours is back.
-        #[cfg(not(windows))]
-        assert_eq!(handler(), ours);
+        let instances = most >> 24;
+        // Which two ran is the threads' order.
+        assert_eq!(got.iter().filter(|r| **r == [1 << 24, instances, 0]).count(), 2, "{got:x?}");
+        assert_eq!(got.iter().filter(|r| **r == [0, instances, 0]).count(), 4, "{got:x?}");
     }
 }

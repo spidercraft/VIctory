@@ -117,7 +117,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
-    /// PSV resource type: 1 sampler, 2 CBV.
+    /// PSV resource type: 1 sampler, 2 CBV, 4 raw SRV, 7 raw UAV.
     pub kind: u32,
     pub space: u32,
     pub register: u32,
