@@ -278,8 +278,10 @@ mod tests {
     #[test]
     fn host_and_guest_blocks_mix() {
         // SAFETY: a host block freed by the guest's LocalFree.
-        let host = unsafe { libc::malloc(40) };
-        assert!(size(host) <= 48);
+        // calloc: size() reads the last usable byte (garbage in a recycled
+        // block), and a reused chunk can be wider than 48, so only a floor holds.
+        let host = unsafe { libc::calloc(1, 40) };
+        assert!(size(host) >= 40);
         assert!(LocalFree(host).is_null());
         let g = GlobalAlloc(LMEM_ZEROINIT, 32);
         assert_eq!(size(g), 32);

@@ -68,11 +68,13 @@ unsafe fn cas16(target: *mut u128, old: u128, new: u128) -> u128 {
     // SAFETY: by the caller; rbx (reserved by LLVM) is swapped in and back.
     unsafe {
         std::arch::asm!(
-            "xchg {new_low}, rbx",
-            "lock cmpxchg16b [{target}]",
-            "mov rbx, {new_low}",
-            target = in(reg) target,
-            new_low = inout(reg) new as u64 => _,
+            "xchg rsi, rbx",
+            "lock cmpxchg16b [rdi]",
+            "mov rbx, rsi",
+            // Fixed registers: with `reg`, LLVM may hand out rbx for an
+            // operand, which the swap above then overwrites.
+            in("rdi") target,
+            inout("rsi") new as u64 => _,
             in("rcx") (new >> 64) as u64,
             inout("rax") low,
             inout("rdx") high,

@@ -679,7 +679,14 @@ mod host {
         } else {
             // SAFETY: not an ordinal, so a NUL-terminated name.
             let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-            system_dlls::proc_address(module as usize, Some(&name), 0)
+            if crate::runtime::image_path(module as usize).is_some() {
+                // A title DLL we mapped (the FidelityFX loader looks its
+                // upscaler up this way): its own export directory.
+                // SAFETY: a mapped PE image.
+                unsafe { victory_loader::linux::image::export_at(module as usize, &name) }
+            } else {
+                system_dlls::proc_address(module as usize, Some(&name), 0)
+            }
         };
         found.map_or_else(
             || {
@@ -838,6 +845,35 @@ mod tests {
 
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exports_of_title_dlls_resolve_by_name() {
+        // A PE with one export, `ffxCreateContext` at RVA 0x300.
+        let mut image = vec![0u8; 0x400];
+        let put = |image: &mut Vec<u8>, at: usize, v: u32| {
+            image[at..at + 4].copy_from_slice(&v.to_le_bytes())
+        };
+        put(&mut image, 0x3c, 0x80); // e_lfanew
+        put(&mut image, 0x80 + 0x88, 0x200); // export directory
+        put(&mut image, 0x80 + 0x8c, 0x40);
+        put(&mut image, 0x200 + 0x18, 1); // NumberOfNames
+        put(&mut image, 0x200 + 0x1c, 0x240); // functions
+        put(&mut image, 0x200 + 0x20, 0x250); // names
+        put(&mut image, 0x200 + 0x24, 0x260); // ordinals (0)
+        put(&mut image, 0x240, 0x300);
+        put(&mut image, 0x250, 0x270);
+        image[0x270..0x280].copy_from_slice(b"ffxCreateContext");
+        let base = image.as_ptr() as usize;
+        runtime::set_image_path(base, std::path::Path::new("/title/upscaler.dll"));
+        let module = base as *mut c_void;
+        assert_eq!(
+            GetProcAddress(module, c"ffxCreateContext".as_ptr().cast()) as usize,
+            base + 0x300
+        );
+        assert!(GetProcAddress(module, c"ffxQuery".as_ptr().cast()).is_null());
+        runtime::forget_image(base);
     }
 
     #[cfg(windows)]
