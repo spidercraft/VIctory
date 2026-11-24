@@ -6,6 +6,9 @@
 //! * Connects and datagram sends to anything but 127.0.0.0/8 and ::1 fail
 //!   with `WSAENETUNREACH`; a bind to all interfaces is narrowed to
 //!   loopback, a bind to any other address fails.
+//! * No socket gets a local address on all interfaces, which is what Linux
+//!   gives an unbound one: `listen` without a bind fails with `WSAEINVAL`,
+//!   as it does on Windows, and a first datagram binds to loopback.
 //! * Name lookups answer `localhost` and address literals only; the rest
 //!   fail with `WSAHOST_NOT_FOUND`.
 //!
@@ -410,8 +413,52 @@ pub extern "win64" fn connect(s: Socket, addr: *const u8, len: i32) -> i32 {
     0
 }
 
+/// The local address of `fd`; unspecified with port 0 until it is bound.
+fn local(fd: i32) -> Option<SocketAddr> {
+    // SAFETY: all-zero is a valid sockaddr_storage.
+    let mut a: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: room for any address.
+    if unsafe { libc::getsockname(fd, &mut a as *mut _ as *mut libc::sockaddr, &mut len) } != 0 {
+        return None;
+    }
+    from_host(&a)
+}
+
+/// Binds an unbound datagram socket to loopback before it sends to `to`.
+/// Linux would bind it to all interfaces, where the network could answer.
+fn bind_datagram(fd: i32, to: &SocketAddr) -> Result<(), i32> {
+    let Some(mut from) = local(fd).filter(|a| a.port() == 0) else {
+        return Ok(());
+    };
+    let mut kind: c_int = 0;
+    let mut len = size_of::<c_int>() as libc::socklen_t;
+    // SAFETY: an int and its size.
+    let r = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut kind as *mut _ as *mut c_void, &mut len) };
+    if r != 0 || kind != libc::SOCK_DGRAM {
+        return Ok(());
+    }
+    from.set_ip(match (from, to.ip().to_canonical()) {
+        (SocketAddr::V4(_), _) => Ipv4Addr::LOCALHOST.into(),
+        // A dual-stack socket sending to 127.0.0.1 needs the mapped address.
+        (SocketAddr::V6(_), IpAddr::V4(_)) => Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(),
+        (SocketAddr::V6(_), IpAddr::V6(_)) => Ipv6Addr::LOCALHOST.into(),
+    });
+    let a = host_addr(&from);
+    // SAFETY: a valid sockaddr and its length.
+    if unsafe { libc::bind(fd, &a.0 as *const _ as *const libc::sockaddr, a.1) } != 0 {
+        return Err(wsa(errno()));
+    }
+    Ok(())
+}
+
 pub extern "win64" fn listen(s: Socket, backlog: i32) -> i32 {
     let fd = fd_or_fail!(s);
+    // Linux binds an unbound socket to all interfaces here. Winsock refuses
+    // it, and `bind` only ever gives a loopback address.
+    if !local(fd).is_some_and(|a| loopback(a.ip())) {
+        return fail(WSAEINVAL);
+    }
     // SAFETY: plain call on our descriptor.
     if unsafe { libc::listen(fd, backlog) } != 0 { os_fail() } else { 0 }
 }
@@ -495,7 +542,10 @@ pub extern "win64" fn sendto(s: Socket, data: *const u8, len: i32, f: i32, to: *
     if to.is_null() {
         return send(s, data, len, f);
     }
-    let a = match guest_addr(to, to_len).and_then(|a| reachable("datagram dropped: no network", a).map(|_| a)) {
+    let a = match guest_addr(to, to_len)
+        .and_then(|a| reachable("datagram dropped: no network", a).map(|_| a))
+        .and_then(|a| bind_datagram(fd, &a).map(|_| a))
+    {
         Ok(a) => host_addr(&a),
         Err(code) => return fail(code),
     };
@@ -1192,6 +1242,57 @@ mod tests {
         assert_eq!(getsockopt(conn, SOL_SOCKET, 0x7777, v.as_mut_ptr(), &mut vlen), SOCKET_ERROR);
         assert_eq!(WSAGetLastError(), WSAENOPROTOOPT);
         for s in [conn, client, server] {
+            assert_eq!(closesocket(s), 0);
+        }
+    }
+
+    #[test]
+    fn an_unbound_socket_never_gets_all_interfaces() {
+        start();
+        let local_of = |s: Socket| {
+            let mut addr = [0u8; 16];
+            let mut len = 16;
+            assert_eq!(getsockname(s, addr.as_mut_ptr(), &mut len), 0);
+            ([addr[4], addr[5], addr[6], addr[7]], u16::from_be_bytes([addr[2], addr[3]]))
+        };
+
+        // Linux would listen on 0.0.0.0 and a port of its choosing.
+        let server = socket(AF_INET, libc::SOCK_STREAM, 6);
+        assert_eq!(listen(server, 1), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), WSAEINVAL);
+        assert_eq!(local_of(server), ([0; 4], 0));
+        assert_eq!(bind(server, v4([127, 0, 0, 1], 0).as_ptr(), 16), 0);
+        assert_eq!(listen(server, 1), 0);
+
+        // A first datagram binds the sender, to loopback.
+        let to = socket(AF_INET, libc::SOCK_DGRAM, 17);
+        assert_eq!(bind(to, v4([127, 0, 0, 1], 0).as_ptr(), 16), 0);
+        let (_, port) = local_of(to);
+        let from = socket(AF_INET, libc::SOCK_DGRAM, 17);
+        assert_eq!(sendto(from, b"x".as_ptr(), 1, 0, v4([127, 0, 0, 1], port).as_ptr(), 16), 1);
+        let (ip, from_port) = local_of(from);
+        assert_eq!(ip, [127, 0, 0, 1]);
+        assert_ne!(from_port, 0);
+        // A bound sender keeps its address.
+        assert_eq!(sendto(from, b"y".as_ptr(), 1, 0, v4([127, 0, 0, 1], port).as_ptr(), 16), 1);
+        assert_eq!(local_of(from), (ip, from_port));
+        let mut got = [0u8; 4];
+        assert_eq!(recv(to, got.as_mut_ptr(), 4, 0), 1);
+
+        // The same for an IPv6 socket sending to 127.0.0.1.
+        let six = socket(AF_INET6, libc::SOCK_DGRAM, 17);
+        let mut mapped = [0u8; 28];
+        mapped[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+        mapped[2..4].copy_from_slice(&port.to_be_bytes());
+        mapped[18..20].copy_from_slice(&[0xff, 0xff]);
+        mapped[20..24].copy_from_slice(&[127, 0, 0, 1]);
+        assert_eq!(sendto(six, b"z".as_ptr(), 1, 0, mapped.as_ptr(), 28), 1);
+        let mut addr = [0u8; 28];
+        let mut len = 28;
+        assert_eq!(getsockname(six, addr.as_mut_ptr(), &mut len), 0);
+        assert_eq!(&addr[8..24], &mapped[8..24]);
+
+        for s in [six, from, to, server] {
             assert_eq!(closesocket(s), 0);
         }
     }
