@@ -28,9 +28,10 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
+ByteAddressBuffer args : register(t0);
+RWByteAddressBuffer dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
@@ -48,7 +49,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint count = min(args.Load(at), 1u << 24);
         uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
         cost = count * instances;
-        args.Store2(at, uint2(count, instances));
+        dest.Store2(at, uint2(count, instances));
+        if (kind == 1) {
+            dest.Store3(at + 8, args.Load3(at + 8));
+        } else {
+            dest.Store2(at + 8, args.Load2(at + 8));
+        }
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
@@ -56,19 +62,19 @@ void main(uint3 id : SV_DispatchThreadID) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
+        dest.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
+        dest.Store3(at, g);
     }
     uint before;
     budget.InterlockedAdd(0, cost, before);
     if (before >= BUDGET || before + cost > BUDGET) {
         // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+        dest.Store(at, 0);
     }
 }
 "#;
@@ -170,56 +176,53 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
-pub(crate) fn bound(
-    list: &HostList,
-    buffer: &ID3D12Resource,
-    gpu: u64,
-    (kind, stride, records): (u32, u32, u32),
-) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
-    };
+/// argument numbering) `stride` bytes apart at host address `gpu`. The
+/// list's private buffer holds the results until [`done`]. Replaces the
+/// list's compute root signature and pipeline (callers bind theirs after).
+pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
+        return None;
     }
+    let c = clamp()?;
+    let budget = list.budget()?;
+    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
     let constants = [kind, stride, records, 0];
-    // SAFETY: an open list; our root signature, pipeline and a live buffer
-    // the caller's list holds.
+    // SAFETY: an open list; the caller holds the input alive and the list
+    // keeps the output and budget allocated.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
+        l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
-                buffer,
+                &out,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
         ]);
     }
-    true
+    Some(out)
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
+/// Restore the private buffer to COMMON for the next clamp.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(
             buffer,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
         )])
     };
 }
@@ -236,6 +239,8 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -261,5 +266,38 @@ mod tests {
         // DXC's LLVM took the fault handler at its first compile; ours is back.
         #[cfg(not(windows))]
         assert_eq!(handler(), ours);
+    }
+
+    #[test]
+    fn argument_clamp_preserves_title_records() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        // Two indexed records with a nonzero base offset and padded stride.
+        let title = [0xfeed, u32::MAX, 9, 31, u32::MAX - 16, 7, 0xbeef, 3, 2, 12, 0, 6, 0];
+        let (input, data) = host.shared_buffer(std::mem::size_of_val(&title) as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the mapping covers the title words and the buffer is idle.
+        let gpu = unsafe {
+            std::ptr::copy_nonoverlapping(title.as_ptr(), data.cast::<u32>(), title.len());
+            input.GetGPUVirtualAddress()
+        };
+        let output = bound(&list, gpu + 4, (1, 24, 2)).expect("clamp recorded");
+        assert_ne!(output, input);
+        assert_eq!(output, list.arguments(48).unwrap());
+        done(&list, &output);
+        list.close();
+        host.execute(&[&list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the GPU finished. Both mapped buffers cover the inspected words.
+        unsafe {
+            output.Map(0, None, Some(&mut mapped)).unwrap();
+            let clamped = std::slice::from_raw_parts(mapped.cast::<u32>(), 11);
+            assert_eq!(&clamped[..5], &[1 << 24, 4, 31, u32::MAX - 16, 7]);
+            assert_eq!(&clamped[6..], &[3, 2, 12, 0, 6]);
+            assert_eq!(std::slice::from_raw_parts(data.cast::<u32>(), title.len()), title);
+        }
     }
 }
