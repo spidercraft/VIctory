@@ -1373,8 +1373,8 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// A submission's pending refreshes, merged per buffer copy into the
+/// union of requested ranges: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -1383,21 +1383,61 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
+/// Keep a single range inline. Merge overlaps before refreshing.
+enum RefreshRanges {
+    One((usize, usize)),
+    Many(Vec<(usize, usize)>),
+}
+
+impl RefreshRanges {
+    fn add(&mut self, (from, to): (usize, usize)) {
+        match self {
+            Self::One((start, end)) if from <= *end && *start <= to => {
+                *start = (*start).min(from);
+                *end = (*end).max(to);
+            }
+            Self::One(previous) => *self = Self::Many(vec![*previous, (from, to)]),
+            Self::Many(ranges) => ranges.push((from, to)),
+        }
+    }
+
+    fn merge(&mut self) -> &[(usize, usize)] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Many(ranges) => {
+                ranges.sort_unstable();
+                // dedup_by passes the later element first and removes it on true.
+                ranges.dedup_by(|next, previous| {
+                    if next.0 > previous.1 {
+                        return false;
+                    }
+                    previous.1 = previous.1.max(next.1);
+                    true
+                });
+                ranges
+            }
+        }
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        if len == 0 {
+            return;
+        }
+        let range = (address, address + len);
         match self
             .refreshes
             .iter_mut()
             .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, ranges)) => ranges.add(range),
+            None => self.refreshes.push((shadow.clone(), RefreshRanges::One(range))),
         }
     }
 
@@ -1415,14 +1455,16 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, mut ranges) in self.refreshes.drain(..) {
+            for &(from, to) in ranges.merge() {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -2216,8 +2258,29 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, RefreshRanges};
     use std::sync::Arc;
+
+    #[test]
+    fn shadow_refreshes_preserve_the_gap_between_requests() {
+        const PAGE: usize = 64 << 10;
+        let mut ranges = RefreshRanges::One((2 * PAGE, 3 * PAGE));
+        ranges.add((0, PAGE));
+        assert_eq!(ranges.merge(), &[(0, PAGE), (2 * PAGE, 3 * PAGE)]);
+    }
+
+    #[test]
+    fn shadow_refreshes_merge_overlapping_and_adjacent_requests() {
+        let mut inline = RefreshRanges::One((20, 30));
+        inline.add((10, 20));
+        assert!(matches!(inline, RefreshRanges::One((10, 30))));
+
+        let mut ranges = RefreshRanges::One((40, 50));
+        for range in [(0, 10), (20, 40), (9, 24), (25, 30), (75, 85)] {
+            ranges.add(range);
+        }
+        assert_eq!(ranges.merge(), &[(0, 50), (75, 85)]);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
@@ -2294,6 +2357,49 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 #[cfg(test)]
 mod device_tests {
     use super::*;
+
+    #[test]
+    fn shadow_refreshes_leave_unrequested_host_bytes_unchanged() {
+        if host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        const PAGE: usize = 64 << 10;
+        let mut title = vec![17u8; 3 * PAGE];
+        title[PAGE..2 * PAGE].fill(29);
+        title[2 * PAGE..].fill(43);
+        let address = title.as_ptr() as usize;
+        let start = address as u64;
+        crate::shadow::register(address, start, title.len() as u64);
+        let shadow = crate::shadow::find(start, title.len() as u64).unwrap();
+        let mut host_pointer = std::ptr::null_mut();
+        // SAFETY: the live host buffer backs all three pages and this test
+        // is the only writer. End this additional map before releasing it.
+        unsafe {
+            shadow.buffer.Map(0, None, Some(&mut host_pointer)).unwrap();
+            host_pointer.cast::<u8>().write_bytes(7, title.len());
+        }
+        let pages_match = |expected: [u8; 3]| {
+            // SAFETY: this mapping is valid and the batch has finished.
+            let host = unsafe { std::slice::from_raw_parts(host_pointer.cast::<u8>(), title.len()) };
+            host.chunks_exact(PAGE)
+                .zip(expected)
+                .all(|(page, byte)| page.iter().all(|&actual| actual == byte))
+        };
+        let mut batch = Batch::default();
+        batch.add(&shadow, address + 2 * PAGE, PAGE);
+        batch.add(&shadow, address, PAGE);
+        batch.flush();
+        let gap_stayed_unchanged = pages_match([17, 7, 43]);
+        batch.add(&shadow, address + PAGE, PAGE);
+        batch.flush();
+        let later_refresh_read_the_gap = pages_match([17, 29, 43]);
+        // SAFETY: balances the test's Map above.
+        unsafe { shadow.buffer.Unmap(0, None) };
+        crate::shadow::unregister(address, start);
+        assert!(gap_stayed_unchanged);
+        assert!(later_refresh_read_the_gap);
+    }
 
     /// A 4x4 RGBA8 render target in `state`.
     fn target(host: &Host) -> ID3D12Resource {
