@@ -69,6 +69,10 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+`VICTORY_SKIP_BINK=1` skips the title's movies that play once (logos and
+the intro); `VICTORY_SKIP_BINK=all` skips the looping ones too, so menu
+backgrounds stay dark.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
