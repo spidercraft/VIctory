@@ -310,6 +310,33 @@ fn writable(at: usize) -> bool {
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn one_alias_refresh_reports_the_write_to_the_other() {
+    use victory_loader::linux::vm::{self, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    victory_loader::linux::signals::install();
+    let mut pages = [0];
+    vm::phys_alloc(&mut pages).unwrap();
+    let first = vm::alloc(0, 2 * PAGE, MEM_RESERVE, PAGE_READWRITE, PAGE).unwrap();
+    let other = first + PAGE;
+    let end = other + PAGE;
+    vm::phys_map(first, &[pages[0], pages[0]], PAGE_READWRITE).unwrap();
+    writes(first, other, true).unwrap();
+    let (other_before, _) = writes(other, end, true).unwrap();
+
+    // SAFETY: the second view is mapped read-write, with the guard active.
+    unsafe { (other as *mut u8).write(9) };
+    let (first_after, first_pages) = writes(first, other, true).unwrap();
+    assert_eq!(first_pages, [(first / PAGE, first_after)]);
+    let (_, other_pages) = writes(other, end, true).unwrap();
+    assert_eq!(other_pages, [(other / PAGE, first_after)]);
+    assert!(first_after > other_before);
+
+    vm::free(first, 0, MEM_RELEASE).unwrap();
+    vm::phys_free(&pages);
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

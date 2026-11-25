@@ -1411,13 +1411,18 @@ fn show(runs: &Runs, shown: &mut Shown, lo: usize, hi: usize) {
 }
 
 /// Before the protection or mappings of `[lo, hi)` change: its guarded
-/// blocks are open, and what its blocks show is forgotten ([`show`] notes
-/// it again).
+/// blocks and their aliases are open, and what its blocks show is
+/// forgotten ([`show`] notes it again).
 fn unwatch(runs: &Runs, shown: &mut Shown, lo: usize, hi: usize) {
     super::watch::open(lo, hi - lo);
     for block in view_blocks(runs, down(lo, BLOCK), up(hi, BLOCK)) {
         for key in showing(runs, block) {
             if let Some(blocks) = shown.get_mut(&key) {
+                // This view might have seen a write. Its peers must still
+                // report it after the view leaves the group.
+                for &peer in blocks.iter().filter(|&&peer| peer != block) {
+                    super::watch::open(peer * BLOCK, BLOCK);
+                }
                 blocks.retain(|&b| b != block);
                 if blocks.is_empty() {
                     shown.remove(&key);
@@ -1432,9 +1437,11 @@ fn unwatch(runs: &Runs, shown: &mut Shown, lo: usize, hi: usize) {
 /// are guarded again. A block is watched when one run of committed
 /// read-write memory holds it, and every block showing the same section
 /// pages is watched with it (guarded too: a write through any of them
-/// counts); a block that cannot be counts as written every time. `None`
-/// when the table has nothing in the range, or (`views` false) when part
-/// of it is a view.
+/// counts). A write is reported for the whole group, including aliases
+/// outside the range, before the guards hide the write from later calls.
+/// A block that cannot be watched counts as written every time. `None`
+/// when the table has nothing in the range, or (`views` false) when part of
+/// it is a view.
 pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
     use super::watch::{guarded, mark};
     let state = state();
@@ -1475,14 +1482,13 @@ pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
                     g.iter().all(|&o| watchable(o).is_some_and(|(s2, r2)| shows(s2, r2, o) == shows(s, r, block)))
                 }).map(Vec::as_slice),
             };
-            let mut clean = group.is_some();
-            for &o in group.into_iter().flatten() {
-                if !guarded(o) {
-                    clean = false;
-                    protect.push(o);
+            if let Some(group) = group {
+                let before = protect.len();
+                protect.extend(group.iter().copied().filter(|&o| !guarded(o)));
+                if protect.len() != before {
+                    written.extend_from_slice(group);
                 }
-            }
-            if !clean {
+            } else {
                 written.push(block);
             }
         }
@@ -1492,6 +1498,8 @@ pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
         return None;
     }
     written.extend(next..last);
+    written.sort_unstable();
+    written.dedup();
     protect.sort_unstable();
     protect.dedup();
     // Marked first: a write before the protection lands, and is copied.
@@ -2019,30 +2027,54 @@ mod tests {
         let (b, end) = (va / g, va + 2 * g);
         // Page 0 at 0 and 2, page 1 at 1.
         phys_map(va, &[pages[0], pages[1], pages[0]], PAGE_READWRITE).unwrap();
-        assert_eq!(guard(va, end, true), Some(vec![b, b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![b, b + 1, b + 2]));
         assert_eq!(guard(va, end, true), Some(vec![]));
         // SAFETY: mapped read-write (to the table).
         unsafe { ((va + 2 * g + 5) as *mut u8).write(9) };
-        assert_eq!(guard(va, end, true), Some(vec![b]));
+        assert_eq!(guard(va, end, true), Some(vec![b, b + 2]));
         // SAFETY: mapped.
         assert_eq!(unsafe { ((va + 5) as *const u8).read() }, 9);
         // A new alias of page 1 (the GPU's page-mapping copies) counts once,
         // then writes through it count.
         alias(va + 3 * g, va + g, g).unwrap();
-        assert_eq!(guard(va, end, true), Some(vec![b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![b + 1, b + 3]));
         assert_eq!(guard(va, end, true), Some(vec![]));
         // SAFETY: mapped read-write.
         unsafe { ((va + 3 * g) as *mut u8).write(1) };
-        assert_eq!(guard(va, end, true), Some(vec![b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![b + 1, b + 3]));
         // Written into the pool outside the views (DirectStorage).
         pool_written(&[pages[0]]);
-        assert_eq!(guard(va, end, true), Some(vec![b]));
+        assert_eq!(guard(va, end, true), Some(vec![b, b + 2]));
         assert_eq!(guard(va, end, false), None, "views are left to the caller");
         free(va, 0, MEM_RELEASE).unwrap();
         let state = state();
         let pool = Arc::as_ptr(state.pool.as_ref().unwrap()) as usize;
         assert!(!state.shown.keys().any(|&(s, p)| s == pool && pages.contains(&p)));
         drop(state);
+        phys_free(&pages);
+    }
+
+    #[test]
+    fn a_dirty_alias_can_disappear_before_the_next_guard() {
+        crate::linux::signals::install();
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let g = PHYS_PAGE;
+        let mut pages = [0];
+        phys_alloc(&mut pages).unwrap();
+        let va = alloc(0, 2 * g, MEM_RESERVE, PAGE_READWRITE, PAGE).unwrap();
+        let alias = va + g;
+        phys_map(va, &[pages[0], pages[0]], PAGE_READWRITE).unwrap();
+        guard(va, alias, true).unwrap();
+        assert_eq!(guard(va, alias, true), Some(vec![]));
+
+        // SAFETY: the writable alias, whose first write is taken by the guard.
+        unsafe { (alias as *mut u8).write(9) };
+        free(alias, g, MEM_DECOMMIT).unwrap();
+        assert_eq!(guard(va, alias, true), Some(vec![va / g]));
+        // SAFETY: the original view remains mapped.
+        assert_eq!(unsafe { (va as *const u8).read() }, 9);
+        assert_eq!(guard(va, alias, true), Some(vec![]));
+        free(va, 0, MEM_RELEASE).unwrap();
         phys_free(&pages);
     }
 }
