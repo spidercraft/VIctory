@@ -339,6 +339,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    arguments: Mutex<Option<ID3D12Resource>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -498,6 +499,8 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Host buffers that earlier shaders in this list used as UAVs.
+    gpu_written: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -573,6 +576,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                arguments: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1199,9 +1203,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        deferred.gpu_written.insert(shadow.buffer.as_raw() as usize);
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    pub(crate) fn gpu_written(&self, buffer: &ID3D12Resource) -> bool {
+        self.deferred().gpu_written.contains(&(buffer.as_raw() as usize))
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -1272,6 +1280,22 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's private argument buffer, in COMMON between uses.
+    pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a descriptor query on a live resource.
+        if let Some(buffer) = arguments.as_ref().filter(|buffer| unsafe { buffer.GetDesc() }.Width >= bytes) {
+            return Some(buffer.clone());
+        }
+        let (buffer, _) = host()?.shared_buffer(bytes.checked_next_power_of_two()?.max(1 << 16))?;
+        name(&buffer, || "indirect arguments".into());
+        // Earlier commands can still reference the smaller allocation.
+        if let Some(old) = arguments.replace(buffer.clone()) {
+            self.keep(&old);
+        }
+        Some(buffer)
     }
 
     /// Keeps `object` alive until the list is reset.
