@@ -255,6 +255,17 @@ victory_seh_probe_store:
     movl $1, %eax
     ret
 
+    .globl victory_seh_copy_bytes
+    .hidden victory_seh_copy_bytes
+victory_seh_copy_bytes:
+    movq %rdx, %rcx
+    .globl victory_seh_copy_move
+    .hidden victory_seh_copy_move
+victory_seh_copy_move:
+    rep movsb
+    movl $1, %eax
+    ret
+
     .p2align 2
 victory_seh_frame_info:
     .byte 0x19, 0, 39, 0
@@ -339,6 +350,8 @@ unsafe extern "C" {
     static victory_seh_probe_fail: u8;
     fn victory_seh_probe_write(address: u64) -> u32;
     static victory_seh_probe_store: u8;
+    pub(super) fn victory_seh_copy_bytes(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    static victory_seh_copy_move: u8;
 }
 
 unsafe extern "win64" {
@@ -427,4 +440,10 @@ pub(crate) fn probe_recovery(rip: u64) -> Option<u64> {
         &raw const victory_seh_probe_fail as u64,
     );
     (rip == load || rip == store).then_some(fail)
+}
+
+/// The copy's faulting instruction uses the probes' zero-return epilogue.
+pub(super) fn copy_recovery(rip: u64) -> Option<u64> {
+    (rip == &raw const victory_seh_copy_move as u64)
+        .then_some(&raw const victory_seh_probe_fail as u64)
 }

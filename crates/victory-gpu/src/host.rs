@@ -1432,10 +1432,9 @@ impl Batch {
 /// them (tiled memory, page mappings), which read as zeros here; a title
 /// destination (`title_dst`) that is not all mapped is left alone.
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// Windows reads through the kernel, which reports an unmapped page instead
+/// of faulting. Linux can read directly into host buffers with
+/// `VICTORY_COPY_PLAIN=1`, recovering from a fault at the copy instruction.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -1454,6 +1453,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
+    #[cfg(not(windows))]
+    let read: fn(*const u8, *mut u8, usize) -> bool =
+        if title_dst { read } else { read_title };
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
@@ -1483,9 +1485,56 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
-/// readable.
+/// readable. A failed read may have overwritten part of `dst`.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    read_title(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// Reads into a writable host buffer. The guarded path skips per-page
+/// probes for disjoint copies. Short reads are often probes themselves,
+/// and the host's memmove can be faster than `rep movsb` for large copies.
+fn read_title(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(not(windows))]
+    if (256..=1 << 20).contains(&len) && src.addr().abs_diff(dst.addr()) >= len {
+        static PLAIN: OnceLock<bool> = OnceLock::new();
+        let plain = *PLAIN.get_or_init(|| {
+            let enabled = std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
+            if enabled {
+                victory_loader::linux::signals::install();
+                tracing::info!("native guarded reads enabled (VICTORY_COPY_PLAIN=1)");
+            }
+            enabled
+        });
+        if plain {
+            // SAFETY: the host buffer is writable, the ranges are disjoint,
+            // and initialization above installed the signal handler.
+            return unsafe { victory_loader::linux::signals::copy_readable(dst, src, len) };
+        }
+    }
+    read(src, dst, len)
+}
+
+#[cfg(all(test, not(windows)))]
+#[test]
+fn guarded_host_copy_keeps_the_mapped_pages_after_a_hole() {
+    use victory_loader::linux::vm;
+
+    const PAGE: usize = 4096;
+    let source = vm::alloc(0, 3 * PAGE, vm::MEM_COMMIT, vm::PAGE_READWRITE, PAGE).unwrap();
+    // SAFETY: all three pages were just committed and are writable.
+    unsafe {
+        (source as *mut u8).write_bytes(17, PAGE);
+        ((source + 2 * PAGE) as *mut u8).write_bytes(29, PAGE);
+    }
+    vm::protect(source + PAGE, PAGE, vm::PAGE_NOACCESS).unwrap();
+
+    let mut out = vec![255u8; 3 * PAGE];
+    copy_mapped(out.as_mut_ptr(), source as *const u8, out.len(), false);
+    vm::free(source, 0, vm::MEM_RELEASE).unwrap();
+
+    assert!(out[..PAGE].iter().all(|&byte| byte == 17));
+    assert!(out[PAGE..2 * PAGE].iter().all(|&byte| byte == 0));
+    assert!(out[2 * PAGE..].iter().all(|&byte| byte == 29));
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not

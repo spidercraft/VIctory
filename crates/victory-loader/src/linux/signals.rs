@@ -51,6 +51,17 @@ pub fn install() {
     attach_thread();
 }
 
+/// Copies into host memory, returning false on an inaccessible source page.
+/// A failed copy can have written a prefix of the destination.
+///
+/// # Safety
+/// The signal handler must be installed. The destination must be writable
+/// for `len` bytes and must not overlap the source.
+pub unsafe fn copy_readable(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    // SAFETY: the destination and non-overlap are the caller's guarantees.
+    unsafe { asm::victory_seh_copy_bytes(dst, src, len) != 0 }
+}
+
 fn ours() -> libc::sigaction {
     // SAFETY: a zeroed sigaction is valid.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -361,6 +372,13 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
         && g[libc::REG_ERR as usize] & 2 != 0
         && super::watch::take_write(g[libc::REG_CR2 as usize] as usize)
     {
+        return;
+    }
+    if (signal == libc::SIGSEGV || signal == libc::SIGBUS)
+        && si.si_code > 0
+        && let Some(to) = asm::copy_recovery(rip)
+    {
+        uc.uc_mcontext.gregs[libc::REG_RIP as usize] = to as i64;
         return;
     }
     let fault = Fault {
