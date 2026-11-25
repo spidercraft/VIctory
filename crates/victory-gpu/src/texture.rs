@@ -6,9 +6,9 @@
 //! copied into the host texture.
 //!
 //! "Changed" means a page of the memory was written since the last detiling
-//! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! ([`crate::watch`]), in write-watched memory. Physical-page views use a
+//! content hash to avoid detiling when a write leaves the texture bytes
+//! unchanged. On Linux the view guards also let clean textures skip the hash.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
@@ -47,9 +47,9 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// What a texture's staging buffer holds: its content hash when used, the
+/// write-watch asking it was checked after (0 when untracked), and room to
+/// read the memory into.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
@@ -185,13 +185,18 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
+        let end = start + size;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        let unchanged = |written: &[(usize, u64)]| {
+            last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked)
+        };
+        if let Some((now, written)) = crate::watch::writes(start, end, false) {
+            if unchanged(&written) {
                 return 0;
             }
             last.asked = now;
+            last.hash = None;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
@@ -201,6 +206,14 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
+        #[cfg(target_os = "linux")]
+        let asked = match crate::watch::writes(start, end, true) {
+            Some((_, written)) if last.hash.is_some() && unchanged(&written) => return 0,
+            Some((now, _)) => now,
+            None => 0,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let asked = 0;
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
@@ -214,6 +227,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
+        last.asked = asked;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -347,4 +361,119 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod alias_tests {
+    use super::*;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    use victory_loader::linux::vm::{
+        self, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM_SRGB;
+
+    const SIZE: usize = 512 << 10;
+    const PAGE: usize = crate::watch::PAGE;
+
+    fn alias_staging(memory: usize) -> Staging {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 512,
+            depth: 1,
+            mips: 1,
+            element_bytes: 16,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        assert_eq!(layout.size, SIZE as u64);
+        let (buffer, data) = host().expect("D3D12 device").upload_buffer(SIZE as u64).unwrap();
+        Staging {
+            buffer,
+            #[cfg(feature = "diagnostics")]
+            size: SIZE as u64,
+            data,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_BC7_UNORM_SRGB,
+                    Width: 1024,
+                    Height: 512,
+                    Depth: 1,
+                    RowPitch: 4096,
+                },
+            }],
+            rows: vec![128],
+            layout,
+            mips: 1,
+            memory: memory as *const u8,
+            last: Mutex::default(),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native D3D12 device"]
+    fn staged_texture_checks_writes_through_another_alias() {
+        victory_loader::linux::signals::install();
+        let mut pages = [0; SIZE / PAGE];
+        vm::phys_alloc(&mut pages).unwrap();
+        let base = vm::alloc(0, 2 * SIZE, MEM_RESERVE, PAGE_READWRITE, PAGE).unwrap();
+        let peer = base + SIZE;
+        for address in [base, peer] {
+            vm::phys_map(address, &pages, PAGE_READWRITE).unwrap();
+        }
+        // SAFETY: the physical pages are mapped read-write.
+        unsafe { (peer as *mut u8).write_bytes(0x11, SIZE) };
+        let staged = alias_staging(base);
+        assert_eq!(staged.refresh_now(), SIZE);
+        assert_eq!(staged.refresh_now(), 0);
+
+        // A same-value write opens the guard but does not detile again.
+        // SAFETY: both the guarded title mapping and the idle staging mapping
+        // are writable. The installed signal handler opens title guards.
+        unsafe {
+            staged.data.write(0xff);
+            (peer as *mut u8).write(0x11);
+        }
+        assert_eq!(staged.refresh_now(), SIZE);
+        // SAFETY: byte zero of the idle staging mapping.
+        assert_eq!(unsafe { staged.data.read() }, 0xff);
+
+        // Another user can re-arm the guards before staging refreshes.
+        // SAFETY: the same guarded, writable mapping.
+        unsafe { (peer as *mut u8).write(0x22) };
+        crate::watch::writes(peer, peer + SIZE, true).unwrap();
+        assert_eq!(staged.refresh_now(), SIZE);
+        // SAFETY: the idle staging mapping as above.
+        assert_eq!(unsafe { staged.data.read() }, 0x22);
+
+        vm::free(base, PAGE, MEM_DECOMMIT).unwrap();
+        assert_eq!(staged.refresh_now(), 0);
+        // Remap the first page to different backing data.
+        vm::phys_map(base, &pages[1..2], PAGE_READWRITE).unwrap();
+        assert_eq!(staged.refresh_now(), SIZE);
+        // SAFETY: the idle staging mapping as above.
+        assert_eq!(unsafe { staged.data.read() }, 0x11);
+
+        // A private mapping changes the staging contents. Restoring the
+        // former physical bytes must not reuse their pre-private hash.
+        vm::free(base, SIZE, MEM_DECOMMIT).unwrap();
+        vm::alloc(base, SIZE, MEM_COMMIT, PAGE_READWRITE, PAGE).unwrap();
+        // SAFETY: the new private mapping is writable.
+        unsafe { (base as *mut u8).write_bytes(0x33, SIZE) };
+        assert_eq!(staged.refresh_now(), SIZE);
+        // SAFETY: the idle staging mapping as above.
+        assert_eq!(unsafe { staged.data.read() }, 0x33);
+        let mut restored = pages;
+        restored[0] = pages[1];
+        vm::phys_map(base, &restored, PAGE_READWRITE).unwrap();
+        assert_eq!(staged.refresh_now(), SIZE);
+        // SAFETY: the idle staging mapping as above.
+        assert_eq!(unsafe { staged.data.read() }, 0x11);
+
+        vm::free(base, 0, MEM_RELEASE).unwrap();
+        vm::phys_free(&pages);
+    }
 }
