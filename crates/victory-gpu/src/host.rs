@@ -2295,6 +2295,25 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 mod device_tests {
     use super::*;
 
+    #[test]
+    fn missing_indirect_pipeline_records_no_clamp() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        let mut state = crate::draw::State::default();
+        let list = host.new_list().unwrap();
+        let title = [1u32; 3];
+        let address = title.as_ptr() as u64;
+        crate::shadow::register(address as usize, address, size_of_val(&title) as u64);
+        let ran = state.execute_indirect(&list, (2, 12, 1), address, None);
+        crate::shadow::unregister(address as usize, address);
+        assert!(!ran);
+        assert!(list.budget.get().is_none());
+        assert!(list.deferred().copies.is_empty());
+        list.close();
+    }
+
     /// A 4x4 RGBA8 render target in `state`.
     fn target(host: &Host) -> ID3D12Resource {
         let mut texture: Option<ID3D12Resource> = None;

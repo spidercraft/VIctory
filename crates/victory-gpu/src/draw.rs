@@ -353,6 +353,10 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
+        self.prepare_graphics(list, p, indexed)
+    }
+
+    fn prepare_graphics(&mut self, list: &HostList, p: &HostPipeline, indexed: bool) -> bool {
         self.bind(list, p, false);
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -969,6 +973,21 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        let Some(pipeline) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        };
+        let matches_kind = match kind {
+            DRAW | INDEXED => self.topology != RECTANGLES && !pipeline.compute && !pipeline.mesh,
+            MESH => !pipeline.compute && pipeline.mesh,
+            DISPATCH => pipeline.compute,
+            _ => false,
+        };
+        if !matches_kind {
+            why("pipeline does not match the indirect command");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -984,10 +1003,7 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let Some(signature) = host_signature(kind, stride) else {
             why("no host signature");
             return false;
         };
@@ -1002,25 +1018,11 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
-                _ => false,
-            },
-            _ => false,
-        };
-        if !ran {
+        if kind == DISPATCH {
+            self.bind(list, pipeline, true);
+        } else if !self.prepare_graphics(list, pipeline, kind == INDEXED) {
             crate::indirect::done(list, &args.buffer);
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
-            }
+            why("index buffer unavailable");
             return false;
         }
         #[cfg(feature = "diagnostics")]
