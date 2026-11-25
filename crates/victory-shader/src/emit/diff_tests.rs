@@ -871,6 +871,59 @@ fn translated_shaders_draw_as_pc_ones() {
 }
 
 #[test]
+#[ignore = "requires PC DXC and a host device with mesh shaders"]
+fn pc_mesh_shader_draws_and_reads_back() {
+    let dxc = PathBuf::from(std::env::var_os("VICTORY_PC_DXC").expect("set VICTORY_PC_DXC"));
+    let host = Host::new(false).expect("create a D3D12 shader model 6.6 device");
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    // SAFETY: the output buffer matches the requested feature structure.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS7,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .unwrap();
+    assert_ne!(
+        options.MeshShaderTier, D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+        "the host device does not support mesh shaders"
+    );
+    let dir = std::env::temp_dir().join(format!("victory-pc-ms-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (_, mesh_groups, source) = MS_CASES[0];
+    let ms = compile(&dxc, &dir, source, "ms", "ms_6_5");
+    let ps = compile(&dxc, &dir, source, "mps", "ps_6_5");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // SAFETY: the compiled mesh shader contains its root signature.
+    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &ms) }.unwrap();
+    let pipeline = host.mesh_pipeline_with(&root, &ms, &ps).unwrap();
+    let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
+    let texels = host
+        .draw(
+            &root,
+            &pipeline,
+            &Draw {
+                roots: vec![(0, Root::Constants(k.to_vec()))],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (16, 16),
+                mesh_groups,
+            },
+        )
+        .unwrap();
+    assert_eq!(texels.len(), 256);
+    assert!(
+        texels
+            .iter()
+            .all(|t| (t[1] + 1.375).abs() < 1e-5 && t[3] == 1.0)
+    );
+}
+
+#[test]
 fn translated_mesh_shaders_draw_as_pc_ones() {
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
