@@ -8,9 +8,9 @@
 //! Linux DXC compiles it, as 6.0, if `VICTORY_DXCOMPILER` names one).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
-//! counted as 64 threads, mesh groups as 128): records past it run empty,
-//! so a list of thousands of garbage records cannot run for seconds
-//! either.
+//! counted as 64 threads, mesh groups as 128): records past it run empty.
+//! Groups reserve work from a saturating counter so rejected costs cannot
+//! wrap it and admit more records.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
@@ -27,28 +27,34 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+/// A counted execution puts its count before the clamped records.
+pub(crate) const COUNT_BYTES: u64 = size_of::<u32>() as u64;
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0), SRV(t1)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint count_bytes; };
+ByteAddressBuffer args : register(t0);
+ByteAddressBuffer count_buf : register(t1);
+RWByteAddressBuffer dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= records) return;
-    uint at = id.x * stride;
+uint clamp_record(uint at, uint dst) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint count = min(args.Load(at), 1u << 24);
         uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
         cost = count * instances;
-        args.Store2(at, uint2(count, instances));
+        dest.Store2(dst, uint2(count, instances));
+        if (kind == 1) {
+            dest.Store3(dst + 8, args.Load3(at + 8));
+        } else {
+            dest.Store2(dst + 8, args.Load2(at + 8));
+        }
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
@@ -56,19 +62,92 @@ void main(uint3 id : SV_DispatchThreadID) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
+        dest.Store3(dst, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
+        dest.Store3(dst, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    return cost;
+}
+
+// Reserve one group's work. A single active group is the only writer, and
+// the UAV barriers between clamps already order its load and store.
+uint reserve_budget(uint cost, bool only_group) {
+    uint before = 0;
+    if (only_group) {
+        before = min(budget.Load(0), BUDGET);
+        if (before < BUDGET) budget.Store(0, before + min(cost, BUDGET - before));
+    } else {
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint after = before + min(cost, BUDGET - before);
+            uint observed = before;
+            budget.InterlockedCompareExchange(0, before, after, observed);
+            if (observed == before) break;
+            before = observed;
+        }
+    }
+    return BUDGET - min(before, BUDGET);
+}
+
+groupshared uint costs[64];
+groupshared uint totals[2];
+groupshared uint allowance;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint active_records = records;
+    if (count_bytes != 0) {
+        active_records = min(active_records, count_buf.Load(0));
+        if (group.x == 0 && lane == 0) dest.Store(0, active_records);
+    }
+    uint first = group.x * 64u;
+    if (first >= active_records) return;
+    uint active_lanes = min(64u, active_records - first);
+    uint at = (first + lane) * stride;
+    uint dst = at + count_bytes;
+    uint cost = 0;
+    [branch]
+    if (lane < active_lanes) cost = clamp_record(at, dst);
+    if (active_lanes == 1) {
+        if (lane == 0 && cost != 0) {
+            uint left = reserve_budget(cost, active_records == 1);
+            if (cost > left) dest.Store(dst, 0);
+        }
+        return;
+    }
+    costs[lane] = cost;
+    if (lane < 2) totals[lane] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    // A half group fits in uint even if every record costs 2^26.
+    if (cost != 0) {
+        uint unused;
+        InterlockedAdd(totals[lane / 32], cost, unused);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0) {
+        uint total = min(totals[0], BUDGET + 1u) + min(totals[1], BUDGET + 1u);
+        allowance = 0;
+        if (total != 0) allowance = reserve_budget(total, active_records <= 64);
+        if (allowance >= total) {
+            allowance = BUDGET;
+        } else if (allowance != 0) {
+            // Just the group that straddles the budget needs a prefix.
+            uint prefix = 0;
+            for (uint i = 0; i < active_lanes; i++) {
+                prefix = min(prefix + costs[i], BUDGET + 1u);
+                costs[i] = prefix;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (cost != 0 && costs[lane] > allowance) {
+        // Clear only the count; the other argument fields keep their layout.
+        dest.Store(dst, 0);
     }
 }
 "#;
@@ -115,13 +194,18 @@ pub(crate) fn compiled() -> windows::core::Result<Vec<u8>> {
 /// The clamp's DXBC, with its root signature.
 #[cfg(windows)]
 fn compiled() -> windows::core::Result<Vec<u8>> {
+    compile_fxc(SOURCE)
+}
+
+#[cfg(windows)]
+fn compile_fxc(source: &str) -> windows::core::Result<Vec<u8>> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -152,8 +236,11 @@ fn compiled() -> windows::core::Result<Vec<u8>> {
 }
 
 fn make() -> windows::core::Result<Clamp> {
+    make_pipeline(&compiled()?)
+}
+
+fn make_pipeline(bytes: &[u8]) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let bytes = &compiled()?[..];
     // SAFETY: the root signature is inside the shader.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
@@ -170,58 +257,73 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// argument numbering) `stride` bytes apart. The list's private buffer
+/// holds the snapped count (when present) and stays readable until the
+/// next clamp writes it.
+/// Replaces the list's compute root signature and pipeline.
 pub(crate) fn bound(
     list: &HostList,
-    buffer: &ID3D12Resource,
-    gpu: u64,
+    args: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
-    };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
+) -> Option<ID3D12Resource> {
+    if !args.1.is_multiple_of(4) || !stride.is_multiple_of(4)
+        || count.is_some_and(|(_, offset)| !offset.is_multiple_of(4))
+    {
+        return None;
     }
+    let c = clamp()?;
+    let budget = list.budget()?;
+    let count_bytes = if count.is_some() { COUNT_BYTES } else { 0 };
+    let bytes = (u64::from(stride) * u64::from(records.max(1))).checked_add(count_bytes)?;
+    let bytes = u32::try_from(bytes).ok()?;
+    let sources = [Some(args.0), count.map(|(buffer, _)| buffer).filter(|&buffer| buffer != args.0)];
+    let written = sources.map(|source| source.filter(|buffer| list.gpu_written(buffer)));
+    // SAFETY: each buffer lives through this recording and its execution.
+    let gpu = unsafe { args.0.GetGPUVirtualAddress() }.checked_add(args.1)?;
+    let count_gpu = match count {
+        Some((buffer, offset)) => unsafe { buffer.GetGPUVirtualAddress() }.checked_add(offset)?,
+        None => gpu,
+    };
+    let (out, before) = list.arguments(u64::from(bytes))?;
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
-    // SAFETY: an open list; our root signature, pipeline and a live buffer
-    // the caller's list holds.
+    let constants = [kind, stride, records, count_bytes as u32];
+    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // SAFETY: an open list; the caller holds the input alive and the list
+    // keeps the output and budget allocated.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(&out, before, uav),
+        ]);
+        for buffer in written.into_iter().flatten() {
+            l.ResourceBarrier(&[transition(buffer, uav, read)]);
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
+        l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
-        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
+        l.SetComputeRootShaderResourceView(4, count_gpu);
+        l.Dispatch(records.div_ceil(64).max(u32::from(count.is_some())), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                &out,
+                uav,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
         ]);
+        // Execution reads the snapshot, so both title buffers can return
+        // to their previous state before the draw binds its resources.
+        for buffer in written.into_iter().flatten() {
+            l.ResourceBarrier(&[transition(buffer, read, uav)]);
+        }
     }
-    true
-}
-
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
+    Some(out)
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -236,6 +338,35 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn read_arguments(
+        host: &crate::host::Host,
+        list: &HostList,
+        args: &ID3D12Resource,
+        bytes: u64,
+    ) -> (ID3D12Resource, *mut u8) {
+        let (readback, data) = host.shared_buffer(bytes).unwrap();
+        let indirect = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+        // SAFETY: an open list, live buffers of at least `bytes`, and a
+        // readable argument buffer left by this list's clamp.
+        unsafe {
+            list.list.ResourceBarrier(&[
+                transition(args, indirect, source),
+                transition(&readback, common, dest),
+            ]);
+            list.list.CopyBufferRegion(&readback, 0, args, 0, bytes);
+            list.list.ResourceBarrier(&[
+                transition(args, source, indirect),
+                transition(&readback, dest, common),
+            ]);
+        }
+        (readback, data)
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -261,5 +392,233 @@ mod tests {
         // DXC's LLVM took the fault handler at its first compile; ours is back.
         #[cfg(not(windows))]
         assert_eq!(handler(), ours);
+    }
+
+    #[test]
+    fn argument_clamp_preserves_title_records() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        // Two indexed records with a nonzero base offset and padded stride.
+        let title = [0xfeed, u32::MAX, 9, 31, u32::MAX - 16, 7, 0xbeef, 3, 2, 12, 0, 6, 0];
+        let (input, data) = host.shared_buffer(std::mem::size_of_val(&title) as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the mapping covers the title words and the buffer is idle.
+        unsafe {
+            std::ptr::copy_nonoverlapping(title.as_ptr(), data.cast::<u32>(), title.len());
+        };
+        let output = bound(&list, (&input, 4), None, (1, 24, 2)).expect("clamp recorded");
+        assert_ne!(output, input);
+        let (_readback, mapped) = read_arguments(host, &list, &output, 11 * 4);
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: the GPU finished. Both mapped buffers cover the inspected words.
+        unsafe {
+            let clamped = std::slice::from_raw_parts(mapped.cast::<u32>(), 11);
+            assert_eq!(&clamped[..5], &[1 << 24, 4, 31, u32::MAX - 16, 7]);
+            assert_eq!(&clamped[6..], &[3, 2, 12, 0, 6]);
+            assert_eq!(std::slice::from_raw_parts(data.cast::<u32>(), title.len()), title);
+        }
+    }
+
+    #[test]
+    fn argument_clamp_budget_never_wraps() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        let clamp_draws = |draws: &[[u32; 4]]| {
+            let bytes = size_of_val(draws) as u64;
+            let (input, data) = host.shared_buffer(bytes).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: the idle mapping holds all supplied draw records.
+            unsafe {
+                std::ptr::copy_nonoverlapping(draws.as_ptr(), data.cast(), draws.len());
+            }
+            let output = bound(&list, (&input, 0), None, (0, 16, draws.len() as u32))
+                .expect("clamp recorded");
+            let (_readback, mapped) = read_arguments(host, &list, &output, bytes);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the clamp completed and each mapping covers the inspected records.
+            unsafe {
+                let records = std::slice::from_raw_parts(mapped.cast::<[u32; 4]>(), draws.len());
+                let counts = records.iter().map(|r| r[0]).collect::<Vec<_>>();
+                assert!(records.iter().zip(draws).all(|(clamped, src)| clamped[2..] == src[2..]));
+                assert_eq!(std::slice::from_raw_parts(data.cast::<[u32; 4]>(), draws.len()), draws);
+                counts
+            }
+        };
+
+        // Each clamped draw costs 2^26, so only two fit. The old add
+        // wrapped at 64 draws and let a further two through.
+        let large = [u32::MAX, 4, 11, 17];
+        let counts = clamp_draws(&[large; 128]);
+        assert_eq!(counts.iter().filter(|&&vertices| vertices != 0).count(), 2);
+
+        // Lane order within a group is fixed. After two draws, the third
+        // consumes the remainder and the small fourth draw is rejected.
+        let almost = [1 << 24, 3, 11, 17];
+        assert_eq!(
+            clamp_draws(&[almost, almost, almost, [1, 1, 11, 17]]),
+            [1 << 24, 1 << 24, 0, 0]
+        );
+
+        let small = vec![[1, 1, 11, 17]; 1 << 16];
+        assert!(clamp_draws(&small).iter().all(|&vertices| vertices == 1));
+    }
+
+    /// An indirect dispatch increments the witness once, regardless of its
+    /// grid size or whether the driver overlaps it with another dispatch.
+    fn dispatch_witness(host: &crate::host::Host) -> (Clamp, ID3D12CommandSignature) {
+        const WITNESS: &str = r#"
+RWByteAddressBuffer output : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    if (all(group == 0)) {
+        uint unused;
+        output.InterlockedAdd(0, 128, unused);
+    }
+}
+"#;
+        #[cfg(windows)]
+        let witness = compile_fxc(WITNESS).expect("witness shader");
+        #[cfg(not(windows))]
+        let witness =
+            victory_shader::hostlib::compile_hlsl(WITNESS, "main", "cs_6_0").expect("witness shader");
+        let c = make_pipeline(&witness).expect("witness pipeline");
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a live description of one dispatch argument with no root changes.
+        unsafe {
+            host.device.CreateCommandSignature(
+                &D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 12,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: &argument,
+                    NodeMask: 0,
+                },
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            ).unwrap();
+        }
+        (c, signature.unwrap())
+    }
+
+    fn record_witness(
+        list: &HostList,
+        (pipeline, signature): &(Clamp, ID3D12CommandSignature),
+        args: &ID3D12Resource,
+        (witness, offset): (&ID3D12Resource, u64),
+        count: u32,
+    ) {
+        // SAFETY: an open list; the arguments and count are in
+        // INDIRECT_ARGUMENT, and all resources live through execution.
+        unsafe {
+            let command = &list.list;
+            command.SetComputeRootSignature(&pipeline.root);
+            command.SetPipelineState(&pipeline.pso);
+            command.SetComputeRootUnorderedAccessView(0, witness.GetGPUVirtualAddress() + offset);
+            command.ExecuteIndirect(signature, count, args, COUNT_BYTES, Some(args), 0);
+        }
+    }
+
+    #[test]
+    fn argument_clamp_counted_dispatches_only_active_records() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        let pipeline = dispatch_witness(host);
+        for count in [0u32, 1, 7] {
+            let title = [2u32, 1, 1, 3, 1, 1, count];
+            let sentinel = [2u32, 1, 1, 1, 1, 1, 1];
+            let seed = [1u32, 1, 1, 1, 1, 1, 2];
+            let (input, data) = host.shared_buffer(size_of_val(&title) as u64).unwrap();
+            let (seed_input, seed_data) = host.shared_buffer(size_of_val(&seed) as u64).unwrap();
+            let (witness, witnessed) = host.shared_buffer(512).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: the idle mappings cover all initialized words.
+            unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr(), data.cast::<u32>(), title.len());
+                std::ptr::copy_nonoverlapping(seed.as_ptr(), seed_data.cast::<u32>(), seed.len());
+                witnessed.cast::<u32>().write(0);
+            }
+            // Populate both slots on the GPU, then check that the next
+            // clamp changes only the slots inside its active count.
+            let seeded = bound(&list, (&seed_input, 0), Some((&seed_input, 24)), (2, 12, 2)).unwrap();
+            let output = bound(&list, (&input, 0), Some((&input, 24)), (2, 12, 2)).unwrap();
+            assert_eq!(seeded, output);
+
+            record_witness(&list, &pipeline, &output, (&witness, 0), 2);
+            let (_readback, mapped) = read_arguments(host, &list, &output, size_of_val(&sentinel) as u64);
+            list.close();
+            host.execute(&[&list]);
+
+            let active = count.min(2) as usize;
+            // SAFETY: the GPU finished and each mapping covers the inspected words.
+            unsafe {
+                let words = std::slice::from_raw_parts(mapped.cast::<u32>(), sentinel.len());
+                assert_eq!(words[0], active as u32);
+                let tail = active * 3;
+                assert_eq!(&words[1..1 + tail], &title[..tail]);
+                assert_eq!(&words[1 + tail..], &sentinel[1 + tail..]);
+                assert_eq!(witnessed.cast::<u32>().read(), (active * 128) as u32);
+                assert_eq!(std::slice::from_raw_parts(data.cast::<u32>(), title.len()), title);
+            }
+        }
+    }
+
+    #[test]
+    fn argument_clamp_reuses_grows_and_replays_scratch() {
+        let Some(host) = host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return;
+        }
+        const LARGE: u32 = 8192;
+        let count = u64::from(LARGE) * 12;
+        let (input, data) = host.shared_buffer(count + 8).unwrap();
+        let (witness, witnessed) = host.shared_buffer(768).unwrap();
+        // SAFETY: both mappings are idle and cover the initialized words.
+        unsafe {
+            std::ptr::copy_nonoverlapping([1u32; 3].as_ptr(), data.cast::<u32>(), 3);
+            data.add(count as usize).cast::<u32>().write(1);
+            data.add(count as usize + 4).cast::<u32>().write(0);
+            witnessed.write_bytes(0, 768);
+        }
+        let pipeline = dispatch_witness(host);
+        let list = host.new_list().unwrap();
+        let record = |max, counter, offset| {
+            let clamped = bound(&list, (&input, 0), Some((&input, counter)), (2, 12, max))
+                .expect("clamp recorded");
+            record_witness(&list, &pipeline, &clamped, (&witness, offset), max);
+            clamped
+        };
+        let first = record(1, count, 0);
+        let second = record(1, count + 4, 256);
+        assert_eq!(first, second);
+        let grown = record(LARGE, count, 512);
+        assert_ne!(second, grown);
+        drop((first, second));
+        list.close();
+        let check = |expected| {
+            host.execute(&[&list]);
+            // SAFETY: the list finished and the witness mapping is live.
+            let observed = [0, 256, 512].map(|i| unsafe { witnessed.add(i).cast::<u32>().read() });
+            assert_eq!(observed, expected);
+        };
+        check([128, 0, 128]);
+        check([256, 0, 256]);
+
+        list.reset();
+        assert_eq!(record(1, count, 0), grown);
+        list.close();
+        check([384, 0, 256]);
     }
 }
