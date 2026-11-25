@@ -426,9 +426,12 @@ extern "win64" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::texture::title_written(from) {
+                crate::texture::upload(list, src, from);
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
+            crate::texture::host_written(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -454,6 +457,46 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// A full overwrite leaves no initial title-memory texels to preserve.
+fn copy_covers_texture(
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    offset: [u32; 3],
+    src: &CopyLocation,
+    src_texture: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    source_box: Option<windows::Win32::Graphics::Direct3D12::D3D12_BOX>,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    // SAFETY: the destination is live.
+    let d = unsafe { to.GetDesc() };
+    let is_3d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if offset != [0; 3] || d.MipLevels != 1 || (!is_3d && d.DepthOrArraySize != 1) {
+        return false;
+    }
+    let depth = if is_3d { u32::from(d.DepthOrArraySize) } else { 1 };
+    let extents = if let Some(b) = source_box {
+        (
+            u64::from(b.right.saturating_sub(b.left)),
+            b.bottom.saturating_sub(b.top),
+            b.back.saturating_sub(b.front),
+        )
+    } else if let Some(texture) = src_texture {
+        // SAFETY: the source is live.
+        let s = unsafe { texture.GetDesc() };
+        if s.MipLevels != 1 {
+            return false;
+        }
+        let depth = if s.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            u32::from(s.DepthOrArraySize)
+        } else {
+            1
+        };
+        (s.Width, s.Height, depth)
+    } else {
+        src.footprint.extents()
+    };
+    extents == (d.Width, d.Height, depth)
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -487,6 +530,7 @@ extern "win64" fn copy_texture_region(
         };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        let mut src_texture = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -512,14 +556,25 @@ extern "win64" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(list, src.resource, texture);
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            src_texture = Some(texture);
+        }
+        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        if crate::texture::title_written(to) {
+            // SAFETY: the title's D3D12_BOX has the same layout.
+            let box_copy = host_box.map(|b| unsafe { *b });
+            if !copy_covers_texture(to, [x, y, z], &src, src_texture, box_copy) {
+                crate::texture::upload(list, dst.resource, to);
+            }
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        crate::texture::host_written(list, dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -597,7 +652,7 @@ extern "win64" fn resolve(
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::host_written(list, dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

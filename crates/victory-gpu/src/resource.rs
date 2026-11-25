@@ -324,6 +324,10 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    pub(crate) fn extents(&self) -> (u64, u32, u32) {
+        (u64::from(self.width), self.height, self.depth)
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -759,6 +763,8 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// True once a submitted list writes this copy on the GPU.
+    pub(crate) host_written: std::sync::atomic::AtomicBool,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -931,6 +937,7 @@ fn hand_out_resource(
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                host_written: false.into(),
             })
         }),
     });
@@ -1575,6 +1582,20 @@ mod tests {
     /// then read back from the host GPU.
     #[test]
     fn buffer_data_reaches_the_host_texture() {
+        check_texture_copy(None, false);
+    }
+
+    #[test]
+    fn texture_partial_copy_preserves_initial_contents() {
+        check_texture_copy(Some([0, 0, 0, 2, 2, 1]), false);
+    }
+
+    #[test]
+    fn texture_read_before_submitted_copy_uses_title_contents() {
+        check_texture_copy(Some([0, 0, 0, 2, 2, 1]), true);
+    }
+
+    fn check_texture_copy(source_box: Option<[u32; 6]>, read_before_write: bool) {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -1597,6 +1618,15 @@ mod tests {
             ),
             S_OK
         );
+        const INITIAL: u8 = 0xaa;
+        if source_box.is_some() {
+            let (memory, _) = texture_memory(image).unwrap();
+            let layout = &texture_layout(&rgba).unwrap().planes[0].layout;
+            // SAFETY: the texture owns its title allocation, with no lists executing.
+            let tiled =
+                unsafe { std::slice::from_raw_parts_mut(memory.cast_mut(), layout.size as usize) };
+            layout.tile(tiled, 0, 0, &[INITIAL; 64], 16, 64).unwrap();
+        }
         assert_eq!(
             create_committed(
                 null,
@@ -1676,9 +1706,10 @@ mod tests {
         };
         type Copy =
             extern "win64" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
-        slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
+        let offset = u32::from(source_box.is_some());
+        let region = source_box.as_ref().map_or(null.cast(), |b| b.as_ptr().cast());
+        slot::<Copy>(list, 0x80)(list, &to, offset, offset, 0, &from, region);
         slot::<extern "win64" fn(This) -> HRESULT>(list, 0x48)(list);
-        slot::<extern "win64" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
         // Read the host texture back into a readback buffer.
         let readback_heap = D3D12_HEAP_PROPERTIES {
@@ -1714,8 +1745,6 @@ mod tests {
         }
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
-        let back = host.new_list().unwrap();
-        let (_, before) = host_transition(image, 0x800).unwrap();
         // The upload list holds the texture until it is reset.
         assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         use windows::core::Interface;
@@ -1729,42 +1758,66 @@ mod tests {
             kind: 0,
             footprint: to.footprint,
         };
-        // SAFETY: an open list, live resources, locations in the host layout.
-        unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            back.list.CopyTextureRegion(
-                (&raw const out_to).cast(),
-                0,
-                0,
-                0,
-                (&raw const out_from).cast(),
-                None,
-            );
-        }
-        back.close();
-        host.execute(&[&back]);
-        let mut mapped = std::ptr::null_mut();
-        // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
-        let read = unsafe {
-            readback
-                .Map(
+        let record_read = || {
+            let back = host.new_list().unwrap();
+            if source_box.is_some() {
+                crate::texture::upload(&back, image, host_image);
+            }
+            crate::list::ensure_state(&back, image, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            // SAFETY: an open list, live resources, locations in the host layout.
+            unsafe {
+                back.list.CopyTextureRegion(
+                    (&raw const out_to).cast(),
                     0,
-                    Some(&D3D12_RANGE {
-                        Begin: 0,
-                        End: 1024,
-                    }),
-                    Some(&mut mapped),
-                )
-                .unwrap();
-            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+                    0,
+                    0,
+                    (&raw const out_from).cast(),
+                    None,
+                );
+            }
+            back.close();
+            back
         };
-        for row in 0..4 {
-            let at = row * 256;
-            assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
+        let check_read = |overlay| {
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
+            let read = unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+            };
+            for y in 0..4 {
+                for x in 0..4 {
+                    let at = y * 256 + x * 4;
+                    let expected = if source_box.is_none() {
+                        &bytes[at..at + 4]
+                    } else if overlay && (1..3).contains(&x) && (1..3).contains(&y) {
+                        let source_at = (y - 1) * 256 + (x - 1) * 4;
+                        &bytes[source_at..source_at + 4]
+                    } else {
+                        &[INITIAL; 4]
+                    };
+                    assert_eq!(
+                        &read[at..at + 4],
+                        expected,
+                        "pixel ({x}, {y}), overlay {overlay}"
+                    );
+                }
+            }
+            // SAFETY: the mapping is no longer needed.
+            unsafe { readback.Unmap(0, None) };
+        };
+        if read_before_write {
+            let read = record_read();
+            let write = crate::list::host_list(list).unwrap();
+            host.execute(&[&read, write]);
+            check_read(false);
+        } else {
+            slot::<extern "win64" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        }
+        host.execute(&[&record_read()]);
+        check_read(true);
+        for object in [list, allocator, queue, image, source] {
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
         }
     }
 
