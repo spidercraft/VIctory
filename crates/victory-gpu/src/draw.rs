@@ -955,7 +955,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
+        // Skip before recording unnecessary clamp work.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
@@ -996,10 +996,16 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        let count_source = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        let Some(clamped) = crate::indirect::bound(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            count_source,
+            (kind, stride, max),
+        ) else {
+            why("argument clamp unavailable");
             return false;
-        }
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1015,7 +1021,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &clamped);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1027,19 +1033,19 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // SAFETY: an open list with everything set; the list holds both
+        // buffers, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                &clamped,
+                if count_source.is_some() { crate::indirect::COUNT_BYTES } else { 0 },
+                count_source.map(|_| &clamped),
+                0,
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
