@@ -35,7 +35,6 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -169,6 +168,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// A copy footprint may leave the final row's trailing padding outside the
+/// allocation returned by GetCopyableFootprints.
+fn staging_subresource(data: &mut [u8], offset: u64, padded_bytes: usize) -> Option<&mut [u8]> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.saturating_add(padded_bytes).min(data.len());
+    data.get_mut(offset..end)
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
@@ -236,18 +243,22 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        // SAFETY: the mapped upload buffer is at least this large and is
+        // written only by the staging refresh.
+        let data = unsafe { std::slice::from_raw_parts_mut(self.data, self.size as usize) };
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+            let depth_pitch = pitch * rows as usize;
+            let bytes = depth_pitch.saturating_mul(f.Depth as usize);
+            let Some(linear) = staging_subresource(data, footprint.Offset, bytes) else {
+                tracing::warn!(mip, slice, "texture footprint starts beyond its staging buffer");
+                return;
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip, slice, linear, pitch, depth_pitch)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -335,7 +346,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
@@ -347,4 +357,141 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod staging_bounds_tests {
+    use super::staging_subresource;
+
+    #[test]
+    fn final_staging_row_does_not_include_unallocated_padding() {
+        let mut data = [0xff; 48];
+        let last = staging_subresource(&mut data, 16, 256).unwrap();
+        assert_eq!(last.len(), 32);
+        last.fill(0);
+        assert_eq!(&data[..16], &[0xff; 16]);
+        assert_eq!(&data[16..], &[0; 32]);
+        assert!(staging_subresource(&mut data, 49, 256).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a D3D12 device with BC7 support"]
+    fn staged_bc7_mips_read_back_without_tail_padding() {
+        use super::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_BC7_UNORM_SRGB, DXGI_SAMPLE_DESC,
+        };
+
+        const MIPS: usize = 8;
+        let host = host().expect("native D3D12 device");
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 512,
+            DepthOrArraySize: 1,
+            MipLevels: MIPS as u16,
+            Format: DXGI_FORMAT_BC7_UNORM_SRGB,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); MIPS];
+        let mut rows = [0; MIPS];
+        let mut row_sizes = [0; MIPS];
+        let mut bytes = 0;
+        // SAFETY: the outputs each have one entry per mip in desc.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &desc, 0, MIPS as u32, 0, Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()), Some(row_sizes.as_mut_ptr()), Some(&mut bytes),
+            );
+        }
+        let last = footprints[MIPS - 1];
+        assert_eq!(bytes - last.Offset, row_sizes[MIPS - 1]);
+        assert!(row_sizes[MIPS - 1] < u64::from(last.Footprint.RowPitch));
+        let (upload, mapped) = host.upload_buffer(bytes).expect("upload buffer");
+        // SAFETY: this upload buffer is mapped for its requested byte size.
+        let data = unsafe { std::slice::from_raw_parts_mut(mapped, bytes as usize) };
+        for (i, footprint) in footprints.iter().enumerate() {
+            let len = footprint.Footprint.RowPitch as usize * rows[i] as usize;
+            staging_subresource(data, footprint.Offset, len).unwrap().fill(i as u8 + 1);
+        }
+
+        let read_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: desc.SampleDesc,
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let create = |desc: &D3D12_RESOURCE_DESC, heap, state| {
+            let mut resource: Option<ID3D12Resource> = None;
+            // SAFETY: the resource description and heap match the requested use.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE, desc, state, None, &mut resource,
+                ).unwrap();
+            }
+            resource.unwrap()
+        };
+        let texture = create(&desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        let readback = create(&read_desc, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        let list = host.new_list().unwrap();
+        for (i, footprint) in footprints.iter().enumerate() {
+            // SAFETY: the resources live through execute and the descriptions
+            // use the device's footprints for the entire corresponding mip.
+            unsafe {
+                let texture_mip = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+                };
+                let buffer_mip = |buffer: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(buffer),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+                };
+                list.list.CopyTextureRegion(&texture_mip, 0, 0, 0, &buffer_mip(&upload), None);
+            }
+        }
+        // SAFETY: the texture lives through execute and currently accepts copies.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        for (i, footprint) in footprints.iter().enumerate() {
+            // SAFETY: the same footprints and live resources are used for readback.
+            unsafe {
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+                };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: execute waited for the copies before mapping the live buffer.
+        let copied = unsafe {
+            let mut mapped = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), bytes as usize)
+        };
+        for (i, footprint) in footprints.iter().enumerate() {
+            for row in 0..rows[i] as usize {
+                let start = footprint.Offset as usize + row * footprint.Footprint.RowPitch as usize;
+                assert!(copied[start..start + row_sizes[i] as usize].iter().all(|&b| b == i as u8 + 1));
+            }
+        }
+    }
 }
