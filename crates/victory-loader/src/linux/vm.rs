@@ -1854,6 +1854,10 @@ mod tests {
     #[test]
     fn physical_pages_map_alias_and_free() {
         let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // Hold previously recycled IDs so the fixture gets one ascending run.
+        let recycled = state().pool_free.len();
+        let mut held = vec![0u64; recycled];
+        phys_alloc(&mut held).unwrap();
         let mut pages = [0u64; 3];
         phys_alloc(&mut pages).unwrap();
         assert!(phys_fd().is_some());
@@ -1883,6 +1887,7 @@ mod tests {
         assert!(pages.contains(&again[0]));
         phys_free(&again);
         free(va, 0, MEM_RELEASE).unwrap();
+        phys_free(&held);
     }
 
     #[test]
