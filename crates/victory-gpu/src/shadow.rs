@@ -75,6 +75,39 @@ fn give_back(v: Vec<u8>) {
     }
 }
 
+/// Applies bytes changed by the GPU to the title snapshot and brings the
+/// host copy back in sync. Returns whether any title bytes need writing.
+fn merge_copy_back(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
+    let (title_words, title_tail) = title.as_chunks_mut::<8>();
+    let (host_words, host_tail) = host.as_chunks_mut::<8>();
+    let (before_words, before_tail) = before.as_chunks::<8>();
+    let mut changed = false;
+    for ((title, host), &before) in title_words.iter_mut().zip(host_words).zip(before_words) {
+        let title_word = u64::from_ne_bytes(*title);
+        let host_word = u64::from_ne_bytes(*host);
+        let diff = host_word ^ u64::from_ne_bytes(before);
+        // Adding 0x7f to the low seven bits sets the high bit if any of
+        // those bits are nonzero. The sum stays within each byte.
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        const LOW: u64 = !HIGH;
+        let nonzero = (diff | ((diff & LOW) + LOW)) & HIGH;
+        // Expand each high bit to 0xff in its byte.
+        let mask = (nonzero >> 7) * 255;
+        let merged = (host_word & mask) | (title_word & !mask);
+        changed |= merged != title_word;
+        *title = merged.to_ne_bytes();
+        *host = *title;
+    }
+    for ((title, host), &before) in title_tail.iter_mut().zip(host_tail).zip(before_tail) {
+        if *host != before && *host != *title {
+            *title = *host;
+            changed = true;
+        }
+        *host = *title;
+    }
+    changed
+}
+
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -212,17 +245,7 @@ impl Shadow {
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
+                    if merge_copy_back(title, host, old) {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
@@ -362,6 +385,40 @@ impl Shadow {
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_copy_back;
+
+    #[test]
+    fn word_merge_matches_byte_merge() {
+        for len in (0..=40).chain([4097, 65536]) {
+            let before: Vec<_> = (0..len + 1).map(|i| i as u8).collect();
+            let before = &before[1..];
+            for gpu_step in [1, 2, 3, 8, 64] {
+                let mut after = before.to_vec();
+                let mut title = before.to_vec();
+                for i in (0..len).step_by(gpu_step) {
+                    after[i] ^= (1 + i % 255) as u8;
+                }
+                for byte in title.iter_mut().skip(1).step_by(3) {
+                    *byte ^= 0x80;
+                }
+                for i in (0..len).step_by(5) {
+                    title[i] = after[i];
+                }
+                let expected: Vec<_> = before.iter().zip(&after).zip(&title)
+                    .map(|((&old, &gpu), &cpu)| if gpu == old { cpu } else { gpu })
+                    .collect();
+                let changed = expected != title;
+                assert_eq!(merge_copy_back(&mut title, &mut after, before), changed);
+                assert_eq!(title, expected);
+                assert_eq!(after, expected);
+                assert!(!merge_copy_back(&mut title, &mut after, before));
+            }
+        }
     }
 }
 
