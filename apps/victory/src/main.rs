@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -57,15 +58,21 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout.
+    /// archives, if uncompressed) and report their layout. Shader packs
+    /// among the paths are listed last, their stages named from the
+    /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
+        /// Print one line per container found (and per pack pipeline).
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Instead list the effects of shader databases: technique, pass,
+        /// shaders (name, container hash, engine hash) and pass state.
+        #[arg(long)]
+        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -79,6 +86,9 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
+        /// Build the shader pack's host pipelines into the runtime cache.
+        #[arg(long, conflicts_with_all = ["validate", "pipelines", "list"])]
+        prebuild_pipelines: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -146,14 +156,22 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+            effects,
+        } => shader::run(paths, verbose || disasm, disasm, effects),
         Command::Translate {
             paths,
             validate,
             pipelines,
+            prebuild_pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => {
+            if prebuild_pipelines {
+                prebuild::run(paths, jobs)
+            } else {
+                translate::run(paths, validate, pipelines, list, jobs)
+            }
+        }
         Command::Run {
             exe,
             unimplemented,
