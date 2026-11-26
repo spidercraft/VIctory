@@ -9,6 +9,7 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::{ResourceType, RootType, UsedResource};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -261,6 +262,62 @@ impl Stage {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct StageTable {
+    last_dword: u32,
+    constant: bool,
+}
+
+/// A table shared by the two graphics stages, which read different spans.
+pub(crate) struct SharedTable {
+    pub(crate) slot: u8,
+    stages: [StageTable; 2],
+}
+
+impl SharedTable {
+    pub(crate) fn for_stages(first: &[UsedResource], second: &[UsedResource]) -> Vec<Self> {
+        let spans = |used: &[UsedResource]| {
+            let mut spans = [None::<StageTable>; 256];
+            for u in used.iter().filter(|u| u.root == RootType::Table) {
+                let span = spans[usize::from(u.slot)].get_or_insert_default();
+                span.last_dword = span.last_dword.max(u.table_offset_dwords);
+                span.constant |= u.kind == ResourceType::Cbv;
+            }
+            spans
+        };
+        spans(first)
+            .into_iter()
+            .zip(spans(second))
+            .enumerate()
+            .filter_map(|(slot, (first, second))| {
+                let (first, second) = (first?, second?);
+                (first.last_dword / 8 != second.last_dword / 8).then_some(Self {
+                    slot: slot as u8,
+                    stages: [first, second],
+                })
+            })
+            .collect()
+    }
+
+    /// A common copy helps only when both stages would allocate a fresh table.
+    pub(crate) fn fresh_count(
+        &self,
+        heap: &crate::descriptor::Heap,
+        table: u64,
+        mirrored: u32,
+    ) -> Option<u32> {
+        if heap.samplers() {
+            return None;
+        }
+        let [first, second] = self.stages.map(|stage| {
+            let end = table.checked_add(u64::from(stage.last_dword) * 4)?;
+            let index = heap.index(end)?;
+            (stage.constant || index >= mirrored).then_some(stage.last_dword / 8 + 1)
+        });
+        Some(first?.max(second?))
+    }
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -270,6 +327,7 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    pub(crate) shared_tables: Vec<SharedTable>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -448,6 +506,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                shared_tables: Vec::new(),
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -455,6 +514,12 @@ impl HostPipeline {
         }
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
+        };
+        let shared_tables = match bound.as_slice() {
+            [first, second] => {
+                SharedTable::for_stages(&first.translated().used, &second.translated().used)
+            }
+            _ => Vec::new(),
         };
         let state = g.describe();
         if mesh.is_some() {
@@ -480,6 +545,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                shared_tables,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -550,6 +616,7 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
+            shared_tables,
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),

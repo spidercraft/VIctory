@@ -1204,6 +1204,14 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_deferred_gpu_write(&self, target: &std::sync::Arc<crate::shadow::Shadow>) -> bool {
+        self.deferred().copies.iter().any(|step| match step {
+            Step::GpuWrite(shadow, ..) => std::sync::Arc::ptr_eq(shadow, target),
+            _ => false,
+        })
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));

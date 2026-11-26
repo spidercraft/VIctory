@@ -21,7 +21,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::host::{HostPipeline, SharedTable};
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -455,7 +455,7 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, compute, &p.shared_tables);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -635,7 +635,13 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+        shared: &[SharedTable],
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -692,10 +698,18 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            // Let both stages find the same cached copy while continuing to
+            // refresh the resources each stage actually uses.
+            let n = shared
+                .iter()
+                .find(|table| table.slot == slot)
+                .and_then(|shared| shared.fresh_count(heap, table, host.count()))
+                .unwrap_or(n);
+            // The table, its span and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
+                n.hash(&mut h);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
@@ -1197,4 +1211,78 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor;
+
+    #[test]
+    fn graphics_stages_share_fresh_tables_and_keep_their_own_writes() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        };
+        let title_heap = descriptor::tests::shader_visible_view_heap(128);
+        let heap = descriptor::heap(title_heap);
+        let table = heap.start;
+        let null = std::ptr::null();
+        let used = |kind, index: u32| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: index * 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let short = [used(ResourceType::Cbv, 63)];
+        let long = [used(ResourceType::Cbv, 0), used(ResourceType::Uav, 103)];
+        let shared = SharedTable::for_stages(&short, &long);
+        assert_eq!(shared[0].fresh_count(heap, table, 128), Some(104));
+        let long_uav_only = SharedTable::for_stages(&short, &long[1..]);
+        assert_eq!(long_uav_only[0].fresh_count(heap, table, 128), None);
+        assert_eq!(long_uav_only[0].fresh_count(heap, table, 100), Some(104));
+        assert_eq!(shared[0].fresh_count(heap, table + 32 * 40, 128), None);
+
+        let constants = [7u32; 4];
+        let address = constants.as_ptr() as u64;
+        let cbv = [address as u32, (address >> 32) as u32, 16, 0];
+        descriptor::create_cbv(null, &cbv, table);
+        descriptor::create_cbv(null, &cbv, table + 63 * 32);
+
+        let buffer = [0u32; 64];
+        let start = buffer.as_ptr() as u64;
+        crate::shadow::register(start as usize, start, 256);
+        let shadow = crate::shadow::find(start, 256).unwrap();
+        let mut resource = [0; 14];
+        resource[0] = D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+        let mut uav = [0; 16];
+        uav[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        uav[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+        uav[4] = 64;
+        uav[8] = D3D12_BUFFER_UAV_FLAG_RAW.0 as u32;
+        uav[10] = start as u32;
+        uav[11] = (start >> 32) as u32;
+        descriptor::create_placed_uav(null, &resource, &uav, table + 103 * 32);
+
+        for (spans, expected_slots) in [(&[][..], 168), (&shared[..], 104)] {
+            let mut state = State::default();
+            state.set_heaps(&[title_heap]);
+            state.graphics.push(Root::Table(table));
+            let list = host.new_list().unwrap();
+            let first = state.tables(&list, &short, false, spans);
+            assert!(!list.has_deferred_gpu_write(&shadow));
+            let second = state.tables(&list, &long, false, spans);
+            assert!(list.has_deferred_gpu_write(&shadow));
+            assert_eq!((first.len(), second.len()), (1, 1));
+            assert_eq!(first == second, !spans.is_empty());
+            assert_eq!(state.dynamic.iter().map(|&(_, _, n)| n).sum::<u32>(), expected_slots);
+            list.close();
+        }
+        crate::shadow::unregister(start as usize, start);
+        crate::object::slot::<extern "win64" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+    }
 }
