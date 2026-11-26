@@ -319,6 +319,13 @@ impl ComputeIo {
         (ids, take(10))
     }
 
+    /// Number of scalar registers initialized by the compute dispatch, including scratch.
+    pub fn initialized_sgprs(&self) -> u8 {
+        let (ids, info) = self.system_sgprs();
+        let system_end = ids.into_iter().chain([info]).flatten().map(|slot| slot + 1).max();
+        system_end.unwrap_or(self.user_sgprs()) + (self.rsrc2 & 1) as u8
+    }
+
     /// Thread id components in v0, v1, v2 (1 to 3).
     pub fn thread_id_vgprs(&self) -> u8 {
         (self.rsrc2 >> 11 & 3) as u8 + 1
@@ -946,6 +953,14 @@ mod tests {
         };
         assert_eq!(cs.system_sgprs(), ([Some(6), Some(7), Some(8)], None));
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
+    }
+
+    #[test]
+    fn initialized_sgprs_covers_user_system_and_scratch() {
+        for (rsrc2, expected) in [(0x90, 9), (0x78C, 10), (0x78D, 11), (0x10, 8)] {
+            let compute = ComputeIo { rsrc2, threads: [64, 1, 1] };
+            assert_eq!(compute.initialized_sgprs(), expected);
+        }
     }
 
     #[test]
