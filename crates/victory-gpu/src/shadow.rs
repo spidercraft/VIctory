@@ -77,8 +77,9 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-// SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// SAFETY: D3D12 resources are free-threaded. A submission gives each
+// persistent mapping to at most one refresh worker and joins all refreshes
+// before accessing the mappings again.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
