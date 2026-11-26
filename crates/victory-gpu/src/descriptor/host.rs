@@ -284,7 +284,8 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds). A zero GPU address
+    /// writes a null CBV.
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
@@ -605,6 +606,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -855,6 +859,27 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_cbv_does_not_allocate_a_shadow() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        for (index, view) in [
+            View::Constant(0, 0),
+            View::Constant(0, 256),
+            View::Constant(0x1000, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = index as u32;
+            assert!(make(&view, heap.cpu(index)).is_none());
+            heap.make_at(index, &view);
+            assert!(heap.kept.lock().unwrap()[index as usize].is_none());
+        }
+        heap.constant_at(3, 0, 0);
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
