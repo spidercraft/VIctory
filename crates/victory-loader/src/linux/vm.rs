@@ -795,6 +795,14 @@ pub fn protect(address: usize, size: usize, new: u32) -> Result<u32, u32> {
     Ok(old)
 }
 
+/// The end of a known guest run that currently has no readable pages.
+pub fn unreadable_run_end(address: usize) -> Option<usize> {
+    let state = state();
+    let runs = &state.runs;
+    let run = &runs[&find(runs, address)?];
+    (!run.committed || native_protect(run.protect) == Some(libc::PROT_NONE)).then_some(run.end)
+}
+
 /// `VirtualQuery`. `ERROR_INVALID_PARAMETER` only above [`HIGHEST`], which
 /// is how a walk ends.
 pub fn query(address: usize) -> Result<MemoryBasicInformation, u32> {

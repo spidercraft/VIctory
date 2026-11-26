@@ -1466,26 +1466,104 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
+    #[cfg(not(windows))]
+    let mut zeroed_until = src.addr();
     for_pieces(src as usize, len, 64 << 10, |at, n| {
+        #[cfg(not(windows))]
+        let (at, n) = {
+            let end = at + n;
+            let at = at.max(zeroed_until);
+            if at >= end {
+                return;
+            }
+            (at, end - at)
+        };
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
+            #[cfg(not(windows))]
+            if !title_dst
+                && let Some(end) = victory_loader::linux::vm::unreadable_run_end(at)
+                && end >= at + n
+            {
+                // The loader owns this unreadable reservation. Fill it
+                // once instead of probing each page in the same run.
+                zeroed_until = end.min(src.addr() + len);
+                zero_unmapped(to, zeroed_until - at);
+                return;
+            }
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
                 if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    zero_unmapped(to, n);
                 }
             });
         }
     });
 }
 
+fn zero_unmapped(dst: *mut u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::Unmapped, len as u64);
+    // SAFETY: inside the caller's mapped destination range.
+    unsafe { dst.write_bytes(0, len) };
+}
+
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
+}
+
+#[cfg(all(test, not(windows)))]
+#[test]
+fn sparse_guest_copy_resumes_inside_a_copy_piece() {
+    use victory_loader::linux::vm;
+
+    const PAGE: usize = 4096;
+    const LEN: usize = 3 << 16;
+    let base = vm::alloc(0, LEN, vm::MEM_RESERVE, vm::PAGE_READWRITE, PAGE).unwrap();
+    let tail = 2 * (64 << 10) + PAGE;
+    vm::alloc(base + tail, LEN - tail, vm::MEM_COMMIT, vm::PAGE_READWRITE, PAGE).unwrap();
+    // SAFETY: the just-committed tail is writable and owned by the test.
+    unsafe { ((base + tail) as *mut u8).write_bytes(71, LEN - tail) };
+    let mut out = vec![255u8; LEN];
+    copy_mapped(out.as_mut_ptr(), base as *const u8, LEN, false);
+    assert!(out[..tail].iter().all(|&byte| byte == 0));
+    assert!(out[tail..].iter().all(|&byte| byte == 71));
+    vm::free(base, 0, vm::MEM_RELEASE).unwrap();
+}
+
+#[cfg(all(test, not(windows)))]
+#[test]
+#[ignore = "measures sparse guest memory copies"]
+fn sparse_guest_copy_174_mib() {
+    use victory_loader::linux::vm;
+
+    const PART: usize = 29 << 20;
+    const LEN: usize = 6 * PART;
+    const PAGE: usize = 4096;
+    let base = vm::alloc(0, LEN, vm::MEM_RESERVE, vm::PAGE_READWRITE, PAGE).unwrap();
+    let expected = [19, 0, 37, 0, 0, 71];
+    for (i, &byte) in expected.iter().enumerate().filter(|(_, byte)| **byte != 0) {
+        let at = base + i * PART;
+        vm::alloc(at, PART, vm::MEM_COMMIT, vm::PAGE_READWRITE, PAGE).unwrap();
+        // SAFETY: the just-committed range is writable and owned by the test.
+        unsafe { (at as *mut u8).write_bytes(byte, PART) };
+    }
+    let mut out = vec![255u8; LEN];
+    copy_mapped(out.as_mut_ptr(), base as *const u8, LEN, false);
+    let mut times = Vec::new();
+    for _ in 0..7 {
+        let started = std::time::Instant::now();
+        copy_mapped(out.as_mut_ptr(), base as *const u8, LEN, false);
+        times.push(started.elapsed().as_nanos());
+    }
+    times.sort_unstable();
+    println!("174 MiB sparse copy, median ns {}", times[3]);
+    for (part, byte) in out.chunks_exact(PART).zip(expected) {
+        assert!(part.iter().all(|&b| b == byte));
+    }
+    vm::free(base, 0, vm::MEM_RELEASE).unwrap();
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
