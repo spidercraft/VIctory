@@ -479,10 +479,25 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    if buffer.NumElements == 0 {
+        // Keep the view's layout while giving the host a null descriptor.
+        // A resource-backed view cannot have a zero-length range.
+        buffer.FirstElement = 0;
+        buffer.NumElements = 1;
+        // SAFETY: the descriptor names a null buffer and a slot of our heap.
+        unsafe {
+            host()?.device.CreateShaderResourceView(
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            );
+        }
+        return Some(None);
+    }
+    let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
         once!(
@@ -513,6 +528,23 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    if buffer.NumElements == 0 {
+        buffer.FirstElement = 0;
+        buffer.NumElements = 1;
+        buffer.CounterOffsetInBytes = 0;
+        // SAFETY: both resources are null and the handle is a slot of our heap.
+        unsafe {
+            host()?.device.CreateUnorderedAccessView(
+                None::<&ID3D12Resource>,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            );
+        }
+        return Some(None);
+    }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -520,8 +552,6 @@ fn buffer_uav(
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
@@ -855,6 +885,38 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_raw_buffer_views_make_null_descriptors_without_a_host_copy() {
+        let Some(heap) = HostHeap::new(false, 2) else {
+            return; // no host GPU
+        };
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 64,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 64,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(matches!(buffer_srv(0, 0, srv, heap.cpu(0)), Some(None)));
+        assert!(matches!(buffer_uav(0, 0, uav, heap.cpu(1)), Some(None)));
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
