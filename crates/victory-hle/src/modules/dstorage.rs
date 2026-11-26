@@ -984,15 +984,45 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         #[cfg(windows)]
         let read = file.seek_read(&mut out[done..], request.offset + done as u64);
         #[cfg(target_os = "linux")]
-        let read = file.read_at(&mut out[done..], request.offset + done as u64);
+        let read = if request.options == 0 {
+            read_guest_at(file, &mut out[done..], request.offset + done as u64)
+        } else {
+            file.read_at(&mut out[done..], request.offset + done as u64)
+        };
         match read {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::warn!(%error, bytes_read = done, "dstorage: host file transfer failed");
+                break Err(from_win32(&error));
+            }
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// A raw file read into title memory. If the renderer rearmed a guard
+/// after the destination was opened, the kernel cannot write through it.
+/// Read a piece into staging before taking the VM lock to land the bytes.
+#[cfg(target_os = "linux")]
+fn read_guest_at(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    match file.read_at(out, offset) {
+        Err(error) if error.raw_os_error() == Some(libc::EFAULT) => {
+            let mut staged = vec![0; out.len().min(PAGE)];
+            let bytes = file.read_at(&mut staged, offset)?;
+            if bytes != 0 {
+                // SAFETY: out owns the first bytes of this request's destination.
+                unsafe {
+                    victory_loader::linux::vm::write_staged(out.as_mut_ptr() as usize, &staged[..bytes])?
+                };
+                tracing::info!(bytes, "dstorage: recovered a file read through staging");
+            }
+            Ok(bytes)
+        }
+        result => result,
+    }
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1238,6 +1268,39 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_file_reads_land_after_write_watch_rearms() {
+        use victory_loader::linux::vm;
+
+        let base = vm::alloc(0, 2 * PAGE, vm::MEM_RESERVE | vm::MEM_COMMIT, vm::PAGE_READWRITE, PAGE)
+            .unwrap();
+        let at = base + PAGE - 32;
+        let bytes = pattern(512);
+        let (_dir, file) = file_with(&bytes);
+        let request = request(0, at as *mut _, 132, file, 17, 132);
+        let pages = vec![base / PAGE, base / PAGE + 1];
+        assert_eq!(vm::guard(base, base + 2 * PAGE, true), Some(pages.clone()));
+
+        // The renderer has guarded the write-watch blocks again, as it
+        // can after into_destination opens the range for the file read.
+        // SAFETY: this range is in the allocation owned by the test.
+        let out = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 132) };
+        // SAFETY: file_with returned a live DirectStorage file object.
+        let host_file = &unsafe { &*file.cast::<Instance<File>>() }.state.file;
+        assert_eq!(host_file.read_at(out, 17).unwrap_err().raw_os_error(), Some(libc::EFAULT));
+        read_into(&request, out).unwrap();
+        assert_eq!(out, &bytes[17..149]);
+        // SAFETY: the bytes bordering the request are in the same allocation.
+        unsafe {
+            assert_eq!(((at - 1) as *const u8).read(), 0);
+            assert_eq!(((at + 132) as *const u8).read(), 0);
+        }
+        assert_eq!(vm::guard(base, base + 2 * PAGE, true), Some(pages));
+        vm::free(base, 0, vm::MEM_RELEASE).unwrap();
+        release::<File>(file.cast());
     }
 
     #[test]

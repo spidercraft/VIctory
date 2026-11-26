@@ -795,6 +795,34 @@ pub fn protect(address: usize, size: usize, new: u32) -> Result<u32, u32> {
     Ok(old)
 }
 
+/// Lands bytes already read from disk while the VM table cannot rearm the
+/// destination's write-watch guards. The kernel checks the destination.
+///
+/// # Safety
+/// `address` must identify a live allocation the caller may write to,
+/// with room for all of `source` and no overlapping borrows.
+pub unsafe fn write_staged(address: usize, source: &[u8]) -> std::io::Result<()> {
+    let _state = state();
+    super::watch::open(address, source.len());
+    let local = libc::iovec {
+        iov_base: source.as_ptr().cast_mut().cast(),
+        iov_len: source.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: address as *mut _,
+        iov_len: source.len(),
+    };
+    // SAFETY: the source is live and the caller owns the destination.
+    let written = unsafe { libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0) };
+    if written < 0 {
+        Err(std::io::Error::last_os_error())
+    } else if written as usize != source.len() {
+        Err(std::io::Error::from_raw_os_error(libc::EFAULT))
+    } else {
+        Ok(())
+    }
+}
+
 /// `VirtualQuery`. `ERROR_INVALID_PARAMETER` only above [`HIGHEST`], which
 /// is how a walk ends.
 pub fn query(address: usize) -> Result<MemoryBasicInformation, u32> {
