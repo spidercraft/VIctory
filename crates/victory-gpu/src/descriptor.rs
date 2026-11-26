@@ -138,13 +138,14 @@ fn mirror(handle: u64) {
     }
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+/// Gives back slots only to the host heap that originally reserved them.
+/// A new title heap can be registered at the same address before a list resets.
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        && host.id() == id
     {
         host.release(first, n);
     }
@@ -655,6 +656,39 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    pub(crate) fn shader_visible_view_heap(count: u32) -> This {
+        let mut heap = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut heap), S_OK);
+        heap
+    }
+
+    #[test]
+    fn a_stale_list_cannot_release_slots_owned_by_a_replacement_heap() {
+        let retired = shader_visible_view_heap(4);
+        let Some(host) = heap(retired).host() else {
+            eprintln!("no host descriptor heap; skipped");
+            release(retired);
+            return;
+        };
+        let retired_id = host.id();
+        let retired_slot = host.dynamic(1).unwrap();
+        release(retired);
+
+        let replacement = shader_visible_view_heap(4);
+        let host = heap(replacement).host().unwrap();
+        // SAFETY: the replacement heap is live for this test.
+        let capacity = unsafe { host.heap.GetDesc().NumDescriptors } - host.count();
+        assert_eq!(host.dynamic(capacity), Some(retired_slot));
+        // A reused title address makes registry lookup find the replacement.
+        release_dynamic(replacement as usize, retired_id, retired_slot, 1);
+        assert_eq!(host.dynamic(1), None);
+
+        release_dynamic(replacement as usize, host.id(), retired_slot, 1);
+        assert_eq!(host.dynamic(1), Some(retired_slot));
+        release(replacement);
     }
 
     #[test]
