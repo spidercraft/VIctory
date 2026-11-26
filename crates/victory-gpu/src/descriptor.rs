@@ -643,7 +643,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
@@ -655,6 +655,13 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    pub(crate) fn shader_visible_view_heap(count: u32) -> This {
+        let mut heap = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut heap), S_OK);
+        heap
     }
 
     #[test]

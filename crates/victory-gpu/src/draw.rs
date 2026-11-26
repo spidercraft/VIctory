@@ -77,6 +77,8 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// A fresh table of the stage being bound could not be made.
+    table_failed: bool,
 }
 
 impl Drop for State {
@@ -353,7 +355,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -412,7 +416,9 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    /// False if the draw or dispatch must not run: a table it reads could
+    /// not be made.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -455,7 +461,19 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
+            if self.table_failed {
+                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(
+                        dropped = n,
+                        "a draw or dispatch dropped: no dynamic slots for its tables"
+                    );
+                }
+                return false;
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -507,6 +525,7 @@ impl State {
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -531,7 +550,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -714,6 +736,12 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
+                // Without its fresh table the shader would read the title's
+                // slots, which for constant buffer tables hold no constant
+                // view: a texture or null descriptor read as a buffer gives
+                // a wild address on AMD and the device is removed (#59).
+                // The draw or dispatch is dropped instead.
+                self.table_failed = true;
                 continue;
             };
             self.fresh_tables.insert(key, first);
@@ -1006,10 +1034,7 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
@@ -1132,6 +1157,55 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor;
+
+    #[test]
+    fn exhausted_dynamic_slots_report_a_failed_table() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        };
+        let title_heap = descriptor::tests::shader_visible_view_heap(4);
+        let heap = descriptor::heap(title_heap);
+        let host_heap = heap.host().unwrap();
+        // SAFETY: the shader-visible heap is live throughout the test.
+        let capacity = unsafe { host_heap.heap.GetDesc().NumDescriptors } - host_heap.count();
+        let reservation = host_heap.dynamic(capacity).unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[title_heap]);
+        state.compute.push(Root::Table(heap.start));
+        let constants = [7u32; 4];
+        let address = constants.as_ptr() as u64;
+        let cbv = [address as u32, (address >> 32) as u32, 16, 0];
+        descriptor::create_cbv(std::ptr::null(), &cbv, heap.start);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let list = host.new_list().unwrap();
+        assert!(state.tables(&list, &used, true).is_empty());
+        assert!(state.table_failed);
+
+        host_heap.release(reservation, capacity);
+        state.table_failed = false;
+        assert_eq!(state.tables(&list, &used, true), [(0, reservation * 32)]);
+        assert!(!state.table_failed);
+
+        list.close();
+        drop(state);
+        crate::object::slot::<extern "win64" fn(This) -> u32>(title_heap, 0x10)(title_heap);
     }
 }
 
