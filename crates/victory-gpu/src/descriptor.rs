@@ -413,8 +413,13 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "win64" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT;
+
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
+        // A host constant view can address 4,096 16-byte registers. Bound the
+        // range before it is copied to scratch or rounded up for the host.
+        let size = size.min(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
         record(handle, View::Constant(address, size));
     }
 }
@@ -681,6 +686,22 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[test]
+    fn constant_views_keep_only_the_bytes_the_host_can_address() {
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        for (size, expected) in [
+            (0, 0),
+            (17, 17),
+            (65_536, 65_536),
+            (65_537, 65_536),
+            (u32::MAX, 65_536),
+        ] {
+            create_cbv(std::ptr::null(), &[0x1000, 1, size, 0], handle);
+            assert_eq!(view(handle), Some(View::Constant(0x1_0000_1000, expected)));
+        }
     }
 
     #[test]
