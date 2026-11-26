@@ -12,6 +12,7 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::VIEW_STRIDES;
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -3097,6 +3098,69 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, big, k, at)
     }
 
+    /// Reads an element-indexed SRV chosen through the resource heap.
+    /// Its element size comes from the slot's current view.
+    fn heap_buffer_load(
+        &mut self,
+        slot: V,
+        index: V,
+        offset: V,
+        count: u32,
+        guard: Option<V>,
+    ) -> Vec<V> {
+        let c = self.cur;
+        let table = self.s.root_srv_handle(VIEW_STRIDES);
+        let read_word = |l: &mut Self, at| {
+            let undef = l.s.m.undef(l.s.t.i32);
+            let mask = l.s.m.i8(1);
+            let align = l.s.m.i32(4);
+            let r = l.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                l.s.t.res_ret,
+                139,
+                &[table, at, undef, mask, align],
+            );
+            let word = l.s.m.extract(c, r, 0);
+            l.as_int(word)
+        };
+        let zero = self.s.m.i32(0);
+        let slots = read_word(self, zero);
+        let in_heap = self.s.m.cmp(c, pred::IULT, slot, slots);
+        let one = self.s.m.i32(1);
+        let word = self.s.m.bin(c, Bin::Add, slot, one);
+        let word = self.s.m.select(c, in_heap, word, zero);
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, word, four);
+        let record = read_word(self, at);
+        let is_buffer = self.s.m.cmp(c, pred::NE, record, zero);
+        let stride = self.s.m.bin(c, Bin::Sub, record, one);
+        let valid = self.s.m.bin(c, Bin::And, in_heap, is_buffer);
+        let valid = guard.map_or(valid, |g| self.s.m.bin(c, Bin::And, valid, g));
+
+        // Keep high bits until the raw offset has been checked. A wrapped
+        // address could otherwise read a different element of this view.
+        self.s.flags |= flags::INT64;
+        let ty = self.s.m.int(64);
+        let index = self.s.m.cast(c, Cast::ZExt, index, ty);
+        let stride = self.s.m.cast(c, Cast::ZExt, stride, ty);
+        let offset = self.s.m.cast(c, Cast::ZExt, offset, ty);
+        let element = self.s.m.bin(c, Bin::Mul, index, stride);
+        let byte = self.s.m.bin(c, Bin::Add, element, offset);
+        let limit = self.s.m.i32(RAW_OFFSET_MAX);
+        let limit = self.s.m.cast(c, Cast::ZExt, limit, ty);
+        let fits = self.s.m.cmp(c, pred::IULE, byte, limit);
+        let valid = self.s.m.bin(c, Bin::And, valid, fits);
+        let branch = self.begin_guarded(Some(valid));
+        let byte = self.s.m.cast(self.cur, Cast::Trunc, byte, self.s.t.i32);
+        let handle = self.s.heap_handle(self.cur, slot, false, (11, 0));
+        let chans = self.raw_load(handle, byte, count);
+        let zero = self.s.m.f32(0);
+        let values: Vec<_> = chans.into_iter().map(|v| (v, zero)).collect();
+        self.end_guarded(branch, &values)
+    }
+
     /// The bytes the host's root SRV of root parameter `slot` holds from
     /// its address on: a user-data dword at the parameter's own index (a
     /// root descriptor's dwords hold no constants), as [`UserData`] with
@@ -5938,6 +6002,23 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        if let (Some(index), Source::Loaded { load, first }) = (index, src)
+            && !typed
+            && !store
+            && atomic.is_none()
+            && used.is_none()
+            && self.scalar.get(load).is_some_and(|a| {
+                self.x
+                    .native
+                    .layout
+                    .get(a.param)
+                    .is_some_and(|p| p.root == RootType::ResourceHeap)
+            })
+        {
+            let slot = self.heap_index(*load, *first, false)?;
+            let chans = self.heap_buffer_load(slot, index, off, count, guard);
+            return self.write_loaded(inst, *data, d16, chans, guard);
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);

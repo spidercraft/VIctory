@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::VIEW_STRIDES;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -77,6 +78,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// The view heap, deferred copy epoch and descriptor revision whose
+    /// buffer SRVs have already been queued for refresh in this list.
+    stride_refresh: Option<(u64, u64, u64)>,
 }
 
 impl Drop for State {
@@ -353,7 +357,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -412,7 +418,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -478,6 +484,21 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == VIEW_STRIDES {
+                        let Some(gpu) = self.bind_view_strides(list) else {
+                            once!("a shader reads strides without a host view heap");
+                            return false;
+                        };
+                        // SAFETY: the heap's mapped stride buffer is kept by the list.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
                         Some(Root::View(address)) => root_view(list, *address, srv),
                         _ => {
@@ -507,6 +528,37 @@ impl State {
                 }
             }
         }
+        true
+    }
+
+    fn bind_view_strides(&mut self, list: &HostList) -> Option<u64> {
+        if self.heaps[0] == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let host = heap.host()?;
+        let buffer = host.stride_buffer()?;
+        let identity = buffer.as_raw() as usize as u64;
+        let epoch = list.refresh_epoch();
+        let known = self.stride_refresh.and_then(|(id, copy_epoch, generation)| {
+            (id == identity && copy_epoch == epoch).then_some(generation)
+        });
+        if let Some((revision, slots)) = host.stride_slots(known) {
+            for index in slots {
+                let handle = heap.start + u64::from(index) * 32;
+                if let Some(view) = host.mirror(index, handle, true)
+                    && let Some((address, len)) = crate::descriptor::host::buffer_range(&view)
+                    && len > 0
+                    && let Some(shadow) = crate::shadow::find(address, len)
+                {
+                    shadow.refresh(list, address, len);
+                }
+            }
+            self.stride_refresh = Some((identity, epoch, revision));
+            list.keep(buffer);
+        }
+        // SAFETY: the list retains this upload buffer.
+        Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
     /// Runs a dispatch on the host.
@@ -531,7 +583,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1006,10 +1061,7 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
@@ -1135,6 +1187,73 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor;
+
+    #[test]
+    fn heap_stride_binding_follows_view_replacement_and_deferred_copies() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        };
+        let title_heap = descriptor::tests::shader_visible_view_heap(4);
+        let heap = descriptor::heap(title_heap);
+        let host_heap = heap.host().unwrap();
+        let null = std::ptr::null();
+        let data = [0u32; 64];
+        let address = data.as_ptr() as u64;
+        crate::shadow::register(address as usize, address, 256);
+        let mut resource = [0; 14];
+        resource[0] = D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+        resource[4] = 256;
+        let mut srv = [0; 16];
+        srv[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        srv[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv[6] = 16;
+        srv[7] = 12;
+        srv[10] = address as u32;
+        srv[11] = (address >> 32) as u32;
+        let handle = heap.start + 32;
+        descriptor::create_placed_srv(null, &resource, &srv, handle);
+
+        let strides = host_heap.stride_buffer().unwrap();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: four title slots plus the length dword from the heap.
+        unsafe { strides.Map(0, None, Some(&mut mapped)).unwrap() };
+        let entry = || unsafe { mapped.cast::<u32>().add(2).read_volatile() };
+        assert_eq!(entry(), 0, "buffer slots are initially deferred");
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[title_heap]);
+        assert_eq!(
+            state.bind_view_strides(&list),
+            Some(unsafe { strides.GetGPUVirtualAddress() })
+        );
+        assert_eq!(entry(), 13);
+
+        srv[7] = 16;
+        descriptor::create_placed_srv(null, &resource, &srv, handle);
+        assert_eq!(entry(), 0);
+        state.bind_view_strides(&list).unwrap();
+        assert_eq!(entry(), 17);
+        let refreshed = state.stride_refresh.unwrap();
+        list.defer(|| {});
+        state.bind_view_strides(&list).unwrap();
+        assert_ne!(state.stride_refresh.unwrap().1, refreshed.1);
+
+        descriptor::create_cbv(null, &[0; 4], handle);
+        state.bind_view_strides(&list).unwrap();
+        assert_eq!(entry(), 0);
+        // SAFETY: balance this test's map while leaving the heap map live.
+        unsafe { strides.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+        list.close();
+        crate::shadow::unregister(address as usize, address);
+        crate::object::slot::<extern "win64" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+    }
+
+}
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {

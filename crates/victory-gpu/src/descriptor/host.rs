@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -30,6 +31,48 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    strides: Option<ViewStrides>,
+}
+
+struct ViewStrides {
+    buffer: ID3D12Resource,
+    mapped: usize,
+    slots: Mutex<(u64, BTreeMap<u32, u64>)>,
+}
+
+impl ViewStrides {
+    fn new(count: u32) -> Option<Self> {
+        let words = u64::from(count) + 1;
+        let (buffer, mapped) = host()?.upload_buffer(words * 4)?;
+        // SAFETY: all words are in the mapped buffer. Its first dword is
+        // immutable and the shader uses it to bound its root SRV reads.
+        unsafe {
+            mapped.cast::<u32>().write_bytes(0, words as usize);
+            mapped.cast::<u32>().write(count);
+        }
+        Some(Self {
+            buffer,
+            mapped: mapped as usize,
+            slots: Mutex::default(),
+        })
+    }
+
+    fn update(&self, index: u32, key: u64, stride: Option<u32>, ready: bool) {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = match stride {
+            Some(_) => slots.1.insert(index, key),
+            None => slots.1.remove(&index),
+        };
+        if previous.is_none() && stride.is_none() {
+            return;
+        }
+        if previous != stride.map(|_| key) {
+            slots.0 = slots.0.wrapping_add(1);
+        }
+        let record = if ready { stride.map_or(0, |v| v + 1) } else { 0 };
+        // SAFETY: callers bound index by the view heap's title slot count.
+        unsafe { (self.mapped as *mut u32).add(index as usize + 1).write_volatile(record) };
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -123,6 +166,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            strides: (!sampler).then(|| ViewStrides::new(count)).flatten(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -305,6 +349,21 @@ impl HostHeap {
         }
     }
 
+    /// Buffer SRVs the heap may expose to element-indexed shader loads.
+    pub(crate) fn stride_slots(&self, known: Option<u64>) -> Option<(u64, Vec<u32>)> {
+        let slots = self
+            .strides
+            .as_ref()?
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (known != Some(slots.0)).then(|| (slots.0, slots.1.keys().copied().collect()))
+    }
+
+    pub(crate) fn stride_buffer(&self) -> Option<&ID3D12Resource> {
+        self.strides.as_ref().map(|strides| &strides.buffer)
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -337,6 +396,9 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
             }
+            if let Some(strides) = &self.strides {
+                strides.update(index, 0, None, false);
+            }
             return None;
         };
         if made[index as usize] != key {
@@ -349,6 +411,9 @@ impl HostHeap {
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+            }
+            if let Some(strides) = &self.strides {
+                strides.update(index, key, buffer_srv_stride(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
         }
@@ -417,6 +482,28 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
         4
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// The stride in the console descriptor. A raw view measures its limit in
+/// bytes and contributes zero per index. A structured view names its stride.
+fn buffer_srv_stride(view: &View) -> Option<u32> {
+    let words = match view {
+        View::Shader(_, Some(words)) => words,
+        View::Placed(false, resource, words) if resource[0] == 1 => words[..10].try_into().ok()?,
+        _ => return None,
+    };
+    let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the description names a buffer SRV.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
+        Some(0)
+    } else {
+        let stride = buffer.StructureByteStride;
+        (stride >= 4 && stride <= 0x3fff && stride.is_multiple_of(4)).then_some(stride)
     }
 }
 
