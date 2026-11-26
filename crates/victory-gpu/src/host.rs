@@ -647,13 +647,21 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+                let list = runs[i];
+                let commands = list.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                if commands > 0 {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    tracing::warn!(
+                        ms = started.elapsed().as_millis(),
+                        commands,
+                        submission_lists = runs.len(),
+                        "slow host list"
+                    );
+                    for (ms, op) in list.slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
