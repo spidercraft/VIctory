@@ -561,6 +561,36 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    #[cfg(not(windows))]
+    owner: Option<std::sync::Arc<ImportedAllocation>>,
+}
+
+#[cfg(not(windows))]
+struct ImportedAllocation {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+// SAFETY: this type owns the allocation. Access to its bytes is through the
+// runtime's raw guest pointers, and freeing does not require guest TLS.
+#[cfg(not(windows))]
+unsafe impl Send for ImportedAllocation {}
+// SAFETY: both fields only describe the owned allocation.
+#[cfg(not(windows))]
+unsafe impl Sync for ImportedAllocation {}
+
+#[cfg(not(windows))]
+impl Drop for ImportedAllocation {
+    fn drop(&mut self) {
+        // SAFETY: this is the last owner of the allocation from Memory::new.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+#[cfg(not(windows))]
+#[windows_core::implement]
+struct ImportedHeapKeepalive {
+    _allocation: std::sync::Arc<ImportedAllocation>,
 }
 
 pub type AllocRoutine = extern "win64" fn(usize, u64) -> *mut c_void;
@@ -624,6 +654,8 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            #[cfg(not(windows))]
+            owner: None,
         })
     }
 
@@ -649,12 +681,43 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            #[cfg(not(windows))]
+            owner: None,
         })
+    }
+
+    #[cfg(not(windows))]
+    fn import_upload(&mut self) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+        use windows::core::{GUID, IUnknown};
+
+        const KEEPALIVE: GUID = GUID::from_u128(0x340535d6_2bc0_42a9_a30f_d9430b7b275c);
+        if self.attributes.is_some() || self.owner.is_some() {
+            return None;
+        }
+        // SAFETY: this is a fresh renderer allocation. We retain it below
+        // on the host heap, which the returned placed buffer retains.
+        let (heap, buffer) = unsafe {
+            crate::host::host()?.import_upload(self.ptr.as_ptr(), self.layout.size())?
+        };
+        let allocation = self.owner.insert(std::sync::Arc::new(ImportedAllocation {
+            ptr: self.ptr,
+            layout: self.layout,
+        }));
+        let keepalive: IUnknown = ImportedHeapKeepalive { _allocation: allocation.clone() }.into();
+        // SAFETY: a live heap and interface. vkd3d-proton frees its imported
+        // VkDeviceMemory before releasing the heap's private interfaces.
+        unsafe { heap.SetPrivateDataInterface(&KEEPALIVE, &keepalive) }.ok()?;
+        tracing::info!(bytes = self.layout.size(), "imported a Linux native upload heap");
+        Some(buffer)
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        #[cfg(not(windows))]
+        if self.owner.is_some() {
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -668,6 +731,8 @@ struct Heap {
     object: Object,
     desc: HeapDesc,
     memory: Memory,
+    #[cfg(not(windows))]
+    imported: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
 }
 
 pub(crate) extern "win64" fn create_heap(
@@ -697,10 +762,26 @@ pub(crate) extern "win64" fn create_heap(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    #[cfg(not(windows))]
+    let (memory, imported) = {
+        const UPLOAD_HEAP: u32 = 2;
+        static IMPORT_UPLOADS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut memory = memory;
+        let imported = if desc.properties.kind == UPLOAD_HEAP
+            && *IMPORT_UPLOADS.get_or_init(|| std::env::var_os("VICTORY_IMPORT_UPLOADS").is_some_and(|v| v == "1"))
+        {
+            memory.import_upload()
+        } else {
+            None
+        };
+        (memory, imported)
+    };
     let heap = Box::new(Heap {
         object: Object::new(&HEAP_FUNCTIONS),
         desc,
         memory,
+        #[cfg(not(windows))]
+        imported,
     });
     object::hand_out(HEAP, heap, iid, &HEAP_IIDS, out)
 }
@@ -900,6 +981,21 @@ impl Resource {
             Backing::Address(at) => at,
         }
     }
+
+    fn register_buffer(&self, resource: usize) {
+        let start = self.data() as u64;
+        #[cfg(not(windows))]
+        if let Backing::Placed { heap, offset } = self.backing
+            && self.desc.flags & 0x4 == 0 // D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        {
+            // SAFETY: a placed resource holds a reference to its heap.
+            if let Some(buffer) = unsafe { &*heap.cast::<Heap>() }.imported.as_ref() {
+                crate::shadow::register_upload(resource, start, self.desc.width, buffer, offset);
+                return;
+            }
+        }
+        crate::shadow::register(resource, start, self.desc.width);
+    }
 }
 
 fn resource<'a>(this: This) -> &'a Resource {
@@ -936,7 +1032,7 @@ fn hand_out_resource(
     });
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        resource.register_buffer(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1365,6 +1461,66 @@ mod tests {
             sample_quality: 0,
             layout: 1,
             flags: 0,
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore = "needs a D3D12 device and explicit upload-import test settings"]
+    fn placed_upload_reads_the_guest_bytes() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+
+        const BYTES: usize = 256;
+        let direct = std::env::var_os("VICTORY_EXPECT_DIRECT_UPLOAD").is_some_and(|v| v == "1");
+        let host = crate::host::host().expect("D3D12 device");
+        let null = std::ptr::null();
+        let mut heap = null;
+        let desc = HeapDesc {
+            size: 2 * KIB_64,
+            properties: HeapProperties { kind: 2, ..PROPERTIES },
+            alignment: KIB_64,
+            flags: 0,
+        };
+        assert_eq!(create_heap(null, &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+        // SAFETY: create_heap returned a live guest heap.
+        let owned = unsafe { &*heap.cast::<Heap>() }.memory.owner.as_ref().map(std::sync::Arc::downgrade);
+        assert_eq!(owned.is_some(), direct);
+
+        let mut placed = null;
+        assert_eq!(
+            create_placed(null, heap, KIB_64, &buffer(KIB_64), 0, null.cast(), &RESOURCE_IIDS[0], &mut placed),
+            S_OK
+        );
+        let address = resource(placed).data();
+        let shadow = crate::shadow::find(address as u64, BYTES as u64).unwrap();
+        assert_eq!(shadow.offset(address as u64), if direct { KIB_64 } else { 0 });
+
+        let list = host.new_list().unwrap();
+        let readback = host.readback_buffer(BYTES as u64).unwrap();
+        shadow.refresh(&list, address as u64, BYTES as u64);
+        // SAFETY: the placed allocation is live and the copy fits both buffers.
+        unsafe {
+            address.write_bytes(57, BYTES);
+            list.list.CopyBufferRegion(&readback, 0, &shadow.buffer, shadow.offset(address as u64), BYTES as u64);
+        }
+        drop(shadow);
+        list.close();
+        if direct {
+            assert_eq!(resource_release(placed), 0);
+            assert_eq!(heap_release(heap), 0);
+            assert!(owned.unwrap().upgrade().is_some());
+        }
+        assert!(host.execute(&[&list]));
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: readback contains the finished copy and the CPU only reads it.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            assert_eq!(std::slice::from_raw_parts(mapped.cast::<u8>(), BYTES), &[57; BYTES]);
+            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        }
+        if !direct {
+            assert_eq!(resource_release(placed), 0);
+            assert_eq!(heap_release(heap), 0);
         }
     }
 

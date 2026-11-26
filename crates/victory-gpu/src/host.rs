@@ -582,7 +582,7 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
-    pub(crate) fn execute(&self, runs: &[&HostList]) {
+    pub(crate) fn execute(&self, runs: &[&HostList]) -> bool {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -616,6 +616,7 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let mut completed = true;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -639,11 +640,14 @@ impl Host {
                 match waited {
                     #[cfg(windows)]
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        completed &= WaitForSingleObject(self.event, INFINITE).0 == 0;
                     }
                     #[cfg(not(windows))]
                     Ok(()) => {}
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        completed = false;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -711,6 +715,7 @@ impl Host {
             }
         }
         self.log_messages();
+        completed
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1582,6 +1587,78 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
+    /// Imports a fresh, private upload allocation. The one-time readback
+    /// detects drivers that substitute their own memory after an import fails.
+    ///
+    /// # Safety
+    /// `data` is an exclusive, writable allocation of `size` bytes. The
+    /// caller must keep it allocated until the returned heap is destroyed.
+    #[cfg(not(windows))]
+    pub(crate) unsafe fn import_upload(
+        &self,
+        data: *mut u8,
+        size: usize,
+    ) -> Option<(ID3D12Heap, ID3D12Resource)> {
+        const ALIGN: usize = 64 << 10;
+        const MARKER: u64 = 0x5892_0436_28b0_b54a;
+        if size == 0 || !size.is_multiple_of(ALIGN) || !data.addr().is_multiple_of(ALIGN) {
+            return None;
+        }
+        let device = self.device.cast::<ID3D12Device13>().ok()?;
+        // SAFETY: the caller owns this aligned and accessible allocation.
+        let heap: ID3D12Heap = unsafe { device.OpenExistingHeapFromAddress1(data.cast(), size) }.ok()?;
+        // SAFETY: plain query on a live heap.
+        if (unsafe { heap.GetDesc() }.Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) == D3D12_HEAP_FLAG_NONE {
+            return None;
+        }
+        let mut buffer = None;
+        // SAFETY: this buffer fits in the imported heap from offset zero.
+        unsafe {
+            self.device.CreatePlacedResource(
+                &heap,
+                0,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )
+        }.ok()?;
+        let buffer = buffer?;
+        let readback = self.readback_buffer(8)?;
+        let list = self.new_list().ok()?;
+        // SAFETY: the backing data is private and both buffers are live.
+        let saved = unsafe {
+            let saved = data.cast::<u64>().read();
+            data.cast::<u64>().write(MARKER);
+            list.list.CopyBufferRegion(&readback, 0, &buffer, 0, 8);
+            saved
+        };
+        list.close();
+        if !self.execute(&[&list]) {
+            fail(format_args!("could not wait for the imported upload heap check"));
+        }
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the list has finished and the readback holds one u64.
+        let observed = unsafe {
+            data.cast::<u64>().write(saved);
+            readback.Map(0, None, Some(&mut mapped)).ok()?;
+            let value = mapped.cast::<u64>().read();
+            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            value
+        };
+        (observed == MARKER).then_some((heap, buffer))
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -1626,6 +1703,36 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// A buffer that the CPU can read after its host submission completes.
+    #[cfg(not(windows))]
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let mut buffer = None;
+        // SAFETY: a valid buffer description and an out pointer for its resource.
+        unsafe {
+            self.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size.max(8),
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        }.ok()?;
+        buffer
     }
 }
 

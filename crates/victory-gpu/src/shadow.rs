@@ -29,6 +29,8 @@ pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
+    /// Offset in an imported upload heap, whose bytes already belong to the title.
+    imported_offset: Option<u64>,
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
@@ -96,22 +98,38 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start
+        self.imported_offset.unwrap_or(0) + (address - self.start)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.imported_offset.is_some() {
+            list.keep(&self.buffer);
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
-        let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+    fn new(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        imported_offset: Option<u64>,
+    ) -> Shadow {
+        let pages = if imported_offset.is_some() {
+            0
+        } else {
+            (start + len).div_ceil(PAGE as u64) - start / PAGE as u64
+        };
         Shadow {
             buffer,
             data,
             gpu,
+            imported_offset,
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
@@ -138,6 +156,9 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.imported_offset.is_some() {
+            return; // Upload heaps only have host GPU read views.
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -263,6 +284,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.imported_offset.is_some() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -379,11 +403,30 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    register_shadow(resource, start, len, None);
+}
+
+/// A placed upload buffer shares the host resource of its whole guest heap.
+#[cfg(not(windows))]
+pub(crate) fn register_upload(
+    resource: usize,
+    start: u64,
+    len: u64,
+    buffer: &ID3D12Resource,
+    offset: u64,
+) {
+    // SAFETY: a live buffer covering the complete upload heap.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + offset;
+    let shadow = Arc::new(Shadow::new(buffer.clone(), std::ptr::null_mut(), gpu, start, len, Some(offset)));
+    register_shadow(resource, start, len, Some(shadow));
+}
+
+fn register_shadow(resource: usize, start: u64, len: u64, shadow: Option<Arc<Shadow>>) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
-            shadow: None,
+            shadow,
         },
     );
 }
@@ -430,7 +473,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
+        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len, None)));
     }
     entry.shadow.clone()
 }
@@ -461,7 +504,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, None));
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
