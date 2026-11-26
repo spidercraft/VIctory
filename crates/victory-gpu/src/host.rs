@@ -26,6 +26,9 @@ use windows::core::Interface;
 #[cfg(windows)]
 use windows::core::{PCWSTR, w};
 
+#[cfg(not(windows))]
+pub(crate) mod planes;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -1663,6 +1666,14 @@ struct Presenter {
     meter: Meter,
 }
 
+#[cfg(feature = "diagnostics")]
+type Seen = (
+    Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>,
+    Option<ID3D12Resource>,
+);
+#[cfg(not(feature = "diagnostics"))]
+type Seen = ();
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -1800,7 +1811,47 @@ impl Host {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        self.show((desc.Width as u32, desc.Height), format, frame, |list, back| {
+            const COPY: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            const DEST: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_DEST;
+            const PRESENT: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PRESENT;
+            // SAFETY: our open presentation list and live source and back buffer.
+            unsafe {
+                if state != COPY {
+                    list.ResourceBarrier(&[transition(texture, state, COPY)]);
+                }
+                list.ResourceBarrier(&[transition(back, PRESENT, DEST)]);
+                list.CopyResource(back, texture);
+                #[cfg(feature = "diagnostics")]
+                let seen = self.present_capture(list, texture, frame);
+                list.ResourceBarrier(&[transition(back, DEST, PRESENT)]);
+                if state != COPY {
+                    list.ResourceBarrier(&[transition(texture, COPY, state)]);
+                }
+                #[cfg(feature = "diagnostics")]
+                return seen;
+            }
+        })
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn present_capture(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, frame: u64) -> Seen {
+        let capture = crate::capture::wanted(frame)
+            .then(|| crate::capture::read_back(&self.device, list, texture))
+            .flatten();
+        (capture, crate::capture::probe(&self.device, list, texture))
+    }
+
+    /// Records a presentation into the back buffer and waits for the list
+    /// before releasing the swap-chain lock.
+    fn show(
+        &self,
+        (width, height): (u32, u32),
+        format: DXGI_FORMAT,
+        frame: u64,
+        record: impl FnOnce(&ID3D12GraphicsCommandList, &ID3D12Resource) -> Seen,
+    ) -> Option<bool> {
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -1826,40 +1877,18 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain and list, held until the submission finishes.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
             p.copy.reset();
-            let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            let seen = record(&p.copy.list, &back);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let (capture, probe) = seen;
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let _ = (seen, frame);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]

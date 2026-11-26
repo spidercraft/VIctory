@@ -138,6 +138,20 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+
+/// The Series S present-plane description. The first 40 bytes contain
+/// the frame token, resources, source rectangles and placement pointer.
+#[cfg(not(windows))]
+#[repr(C)]
+struct DisplayPlane {
+    prefix: Plane,
+    source: *const [i32; 4],
+    destination: *const [f32; 4],
+    tail: [u8; 32],
+}
+
+#[cfg(not(windows))]
+const _: () = assert!(size_of::<DisplayPlane>() == 72);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "win64" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -277,6 +291,10 @@ extern "win64" fn present(
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    #[cfg(not(windows))]
+    if present_display_planes(planes, plane_parameters, frame).is_some() {
+        return S_OK;
+    }
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -298,6 +316,51 @@ extern "win64" fn present(
         let _ = shown;
     }
     S_OK
+}
+
+#[cfg(not(windows))]
+fn present_display_planes(planes: u32, base: *const Plane, frame: u64) -> Option<()> {
+    use crate::host::planes::Shown;
+    if !(2..=4).contains(&planes) || base.is_null() {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut inputs = Vec::with_capacity(planes as usize);
+    // SAFETY: PresentX supplies this many 72-byte descriptions. Their
+    // resource arrays and optional rectangle pointers live for the call.
+    let parameters = unsafe { std::slice::from_raw_parts(base.cast::<DisplayPlane>(), planes as usize) };
+    let token = parameters[0].prefix.token;
+    for plane in parameters {
+        let Plane { token: tag, count, resources } = plane.prefix;
+        if tag != token || !(1..=8).contains(&count) || resources.is_null() {
+            return None;
+        }
+        // SAFETY: at least one live resource and one rectangle if supplied.
+        let (resource, source, destination) = unsafe {
+            (*resources, plane.source.as_ref().copied(), plane.destination.as_ref().copied())
+        };
+        let texture = crate::resource::host_resource(resource)?;
+        inputs.push((resource, texture, source, destination));
+    }
+    const READ: u32 = 0x80;
+    let mut saved = Vec::with_capacity(inputs.len());
+    let shown: Vec<_> = inputs.iter().map(|&(resource, texture, source, destination)| {
+        let state = if let Some((_, state)) = saved.iter().find(|(old, _)| *old == resource) {
+            *state
+        } else {
+            let state = crate::resource::host_transition(resource, READ).map_or(READ, |(_, state)| state);
+            saved.push((resource, state));
+            state
+        };
+        Shown { texture, state, source, destination }
+    }).collect();
+    let presented = host.present_planes(&shown, frame);
+    for (resource, state) in saved {
+        crate::resource::host_transition(resource, state);
+    }
+    #[cfg(feature = "diagnostics")]
+    blinks(frame, inputs[0].0, shown[0].state, presented);
+    presented.map(|_| ())
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
