@@ -686,21 +686,7 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
-                }
-            }
-        }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
+        for (shadow, address, len) in batch.gpu_writes {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
@@ -1355,9 +1341,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                    batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1384,11 +1368,26 @@ impl HostList {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Unique writes in declaration order, held through copy-back.
+    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    seen_writes: std::collections::HashSet<(usize, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
+    fn gpu_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if self.seen_writes.insert(key) {
+            // The first declaration needs the title data. Later declarations
+            // use the same snapshot and the pending range already excludes
+            // refreshes until the submission is copied back.
+            self.flush();
+            shadow.writing(address, len);
+            self.gpu_writes.push((shadow.clone(), address, len));
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         match self
@@ -2294,6 +2293,63 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 #[cfg(test)]
 mod device_tests {
     use super::*;
+
+    #[test]
+    fn repeated_gpu_writes_keep_unrelated_refreshes_queued() {
+        let Some(host) = host() else {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        };
+        let mut title = [11u8; 256];
+        let address = title.as_mut_ptr() as usize;
+        let start = address as u64;
+        crate::shadow::register(address, start, title.len() as u64);
+        let shadow = crate::shadow::find(start, title.len() as u64).unwrap();
+        let mut pointer = std::ptr::null_mut();
+        // SAFETY: the host buffer is live and this test owns its contents.
+        let mapped = unsafe {
+            shadow.buffer.Map(0, None, Some(&mut pointer)).unwrap();
+            let mapped = pointer.cast::<u8>();
+            mapped.write_bytes(0, title.len());
+            mapped
+        };
+        let read = |offset: usize| {
+            // SAFETY: both tested 64-byte ranges are inside this mapping.
+            unsafe { mapped.add(offset).cast::<[u8; 64]>().read() }
+        };
+
+        let first = host.new_list().unwrap();
+        shadow.refresh(&first, start, 64);
+        shadow.gpu_writes(&first, start, 64);
+        let second = host.new_list().unwrap();
+        shadow.refresh(&second, start + 128, 64);
+        shadow.gpu_writes(&second, start, 64);
+        first.close();
+        second.close();
+
+        let mut batch = Batch::default();
+        first.run_deferred(&mut batch);
+        assert_eq!(read(0), [11; 64]);
+        second.run_deferred(&mut batch);
+        second.run_deferred(&mut batch);
+        assert_eq!(read(128), [0; 64]);
+        assert_eq!(batch.gpu_writes.len(), 1);
+        batch.flush();
+        assert_eq!(read(128), [11; 64]);
+
+        // Stand in for GPU writes after all lists have been prepared. The
+        // copy-back must preserve a separate write to title memory.
+        // SAFETY: the live mapping belongs to the fixture.
+        unsafe { mapped.write(42) };
+        title[1] = 29;
+        for (shadow, address, len) in batch.gpu_writes {
+            shadow.copy_back(address, len);
+        }
+        assert_eq!(&title[..3], &[42, 29, 11]);
+        // SAFETY: balances Map above, after the last access to the mapping.
+        unsafe { shadow.buffer.Unmap(0, None) };
+        crate::shadow::unregister(address, start);
+    }
 
     /// A 4x4 RGBA8 render target in `state`.
     fn target(host: &Host) -> ID3D12Resource {
