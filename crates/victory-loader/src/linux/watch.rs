@@ -63,6 +63,29 @@ pub(crate) fn guarded(block: usize) -> bool {
     bits().is_some_and(|b| block / 64 < WORDS && b[block / 64].load(Ordering::Acquire) >> (block % 64) & 1 != 0)
 }
 
+/// Appends the unguarded blocks of a private run, skipping clean bitmap words.
+pub(crate) fn extend_unguarded(first: usize, last: usize, out: &mut Vec<usize>) {
+    let Some(bits) = bits() else {
+        out.extend(first..last);
+        return;
+    };
+    let mut block = first;
+    while block < last {
+        let word = block / 64;
+        let base = word * 64;
+        let end = last.min(base + 64);
+        let mut dirty = !bits.get(word).map_or(0, |bits| bits.load(Ordering::Acquire));
+        if dirty != 0 {
+            dirty &= (u64::MAX << (block - base)) & (u64::MAX >> (64 - (end - base)));
+            while dirty != 0 {
+                out.push(base + dirty.trailing_zeros() as usize);
+                dirty &= dirty - 1;
+            }
+        }
+        block = end;
+    }
+}
+
 /// Notes `block` guarded; the caller then makes it read-only.
 pub(crate) fn mark(block: usize) {
     made()[block / 64].fetch_or(1 << (block % 64), Ordering::AcqRel);

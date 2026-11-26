@@ -1436,7 +1436,7 @@ fn unwatch(runs: &Runs, shown: &mut Shown, lo: usize, hi: usize) {
 /// when the table has nothing in the range, or (`views` false) when part
 /// of it is a view.
 pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
-    use super::watch::{guarded, mark};
+    use super::watch::{extend_unguarded, guarded, mark};
     let state = state();
     let (runs, shown) = (&state.runs, &state.shown);
     // The run holding all of `block` when it is watchable, as (start, run).
@@ -1468,22 +1468,29 @@ pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
         if !(r.committed && r.protect == PAGE_READWRITE) {
             continue;
         }
-        for block in next..b {
-            let group = match r.view {
-                None => Some(std::slice::from_ref(&block)),
-                Some(_) => shows(s, r, block).and_then(|key| shown.get(&key)).filter(|g| {
-                    g.iter().all(|&o| watchable(o).is_some_and(|(s2, r2)| shows(s2, r2, o) == shows(s, r, block)))
-                }).map(Vec::as_slice),
-            };
-            let mut clean = group.is_some();
-            for &o in group.into_iter().flatten() {
-                if !guarded(o) {
-                    clean = false;
-                    protect.push(o);
+        if r.view.is_none() {
+            let before = protect.len();
+            extend_unguarded(next, b, &mut protect);
+            written.extend_from_slice(&protect[before..]);
+        } else {
+            for block in next..b {
+                let group = shows(s, r, block).and_then(|key| {
+                    shown.get(&key).filter(|group| {
+                        group.iter().all(|&peer| {
+                            watchable(peer).is_some_and(|(start, run)| shows(start, run, peer) == Some(key))
+                        })
+                    })
+                });
+                let mut clean = group.is_some();
+                for &peer in group.into_iter().flatten() {
+                    if !guarded(peer) {
+                        clean = false;
+                        protect.push(peer);
+                    }
                 }
-            }
-            if !clean {
-                written.push(block);
+                if !clean {
+                    written.push(block);
+                }
             }
         }
         next = next.max(b);
@@ -2003,6 +2010,59 @@ mod tests {
         assert_eq!(guard(host.as_ptr() as usize, host.as_ptr() as usize + BLOCK, true), None);
         free(base, 0, MEM_RELEASE).unwrap();
         free(code, 0, MEM_RELEASE).unwrap();
+    }
+
+    #[test]
+    fn guard_limits_partial_bitmap_words_to_the_requested_range() {
+        let base = alloc(0, 72 * BLOCK, MEM_COMMIT, PAGE_READWRITE, PAGE).unwrap();
+        let edge = (base + 2 * BLOCK).next_multiple_of(64 * BLOCK);
+        let start = edge - BLOCK;
+        let end = edge + BLOCK;
+        let left = start - BLOCK;
+        let right = end + BLOCK;
+        let block = edge / BLOCK;
+        assert_eq!(guard(start, end, true), Some(vec![block - 1, block]));
+        assert_eq!(guard(start, end, true), Some(vec![]));
+
+        super::super::watch::open(start, 2 * BLOCK);
+        assert_eq!(guard(start, end, true), Some(vec![block - 1, block]));
+        assert_eq!(guard(left, right, true), Some(vec![block - 2, block + 1]));
+        free(base, 0, MEM_RELEASE).unwrap();
+    }
+
+    #[test]
+    #[ignore = "measures large guarded ranges"]
+    fn large_guarded_range_scan() {
+        const BLOCKS: usize = 174 * 16;
+        const PASSES: usize = 4096;
+        let base = alloc(0, BLOCKS * BLOCK, MEM_COMMIT, PAGE_READWRITE, PAGE).unwrap();
+        let end = base + BLOCKS * BLOCK;
+        assert_eq!(guard(base, end, true).unwrap().len(), BLOCKS);
+
+        let mut clean = Vec::new();
+        let mut sparse = Vec::new();
+        let blocks = [0, 63, 64, BLOCKS - 1];
+        let expected = blocks.map(|block| base / BLOCK + block);
+        for _ in 0..9 {
+            let start = std::time::Instant::now();
+            for _ in 0..PASSES {
+                assert!(guard(base, end, true).unwrap().is_empty());
+            }
+            clean.push(start.elapsed().as_nanos() / PASSES as u128);
+
+            let start = std::time::Instant::now();
+            for _ in 0..PASSES / 8 {
+                for block in blocks {
+                    super::super::watch::open(base + block * BLOCK, BLOCK);
+                }
+                assert_eq!(guard(base, end, true).unwrap(), expected);
+            }
+            sparse.push(start.elapsed().as_nanos() / (PASSES as u128 / 8));
+        }
+        clean.sort_unstable();
+        sparse.sort_unstable();
+        println!("{BLOCKS} blocks, median ns: clean {}, four dirty {}", clean[4], sparse[4]);
+        free(base, 0, MEM_RELEASE).unwrap();
     }
 
     /// A physical page shown at several addresses is guarded at all of
