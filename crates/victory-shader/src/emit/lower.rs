@@ -2911,6 +2911,14 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
+            Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
+                // smem binds scalar SRV reads through a raw buffer view.
+                match used.map(|u| u.kind) {
+                    Some(ResourceType::Srv) => ((11, 0), None),
+                    Some(ResourceType::Cbv) => return Err("a constant buffer's descriptor read as data"),
+                    _ => return Err("a scalar memory read as data"),
+                }
+            }
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
@@ -2963,7 +2971,18 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let size = field(self, 0);
+                let stride = used.map_or(0, |u| u.stride);
+                // GetDimensions on a raw SRV reports bytes.
+                let records = if matches!(ui.fields, Fields::Smem { .. }) && stride > 1 {
+                    let stride = self.s.m.i32(stride);
+                    self.s.m.bin(c, Bin::UDiv, size, stride)
+                } else {
+                    size
+                };
+                vec![(2, records)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -6827,5 +6846,114 @@ mod tests {
             "the atomic's annotation: {:x?}",
             lowered.annotations
         );
+    }
+
+    #[test]
+    fn a_scalar_buffer_load_preserves_the_descriptor_record_count() {
+        use crate::emit::HostShader;
+        use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+        let lower_one = |kind, stride| {
+            let words = [
+                0xBE84_0300u32, // s_mov_b32 s4, s0
+                0xBE85_0380,    // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xF420_0304,
+                0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+                0x800D_0A0C, // s_add_u32 s13, s12, s10 (data plus record count)
+                0x7E02_020D, // v_mov_b32 v1, s13
+                0xF408_0402,
+                0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+                0xE070_0000,
+                0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+                S_ENDPGM,
+            ];
+            let used = |kind, table_offset_dwords, stride| UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            };
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![used(kind, 0, stride), used(ResourceType::Uav, 8, 0)],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 2,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 8).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        let error = lower_one(ResourceType::Cbv, 0).err().unwrap();
+        assert!(error.to_string().contains("a constant buffer's descriptor read as data"));
+        let host = Host::new(false).ok();
+        for (stride, records) in [(0, 32), (4, 8)] {
+            let mut lowered = lower_one(ResourceType::Srv, stride).unwrap();
+            if let Ok(mut validator) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                validator.validate(&mut lowered.dxil).unwrap();
+            }
+            let Some(host) = &host else {
+                eprintln!("no SM 6.6 host; readback skipped");
+                continue;
+            };
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: lowered.dxil,
+                user_data: lowered.user_data,
+                samplers: lowered.samplers,
+                static_samplers: vec![],
+                root_cbvs: lowered.root_cbvs,
+                root_srvs: lowered.root_srvs,
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let out = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                    views: &[
+                        View::Buffer { data: &[86, 0, 0, 0, 0, 0, 0, 0], stride: Stride::Raw },
+                        View::RawUav(1),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).unwrap();
+            assert_eq!(out, [vec![86 + records]]);
+            eprintln!("scalar buffer readback: stride {stride}, records {records}");
+        }
     }
 }
