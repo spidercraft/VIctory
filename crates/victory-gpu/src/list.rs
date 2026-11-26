@@ -750,28 +750,40 @@ extern "win64" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     state::dispatch(this, x, y, z);
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "win64" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery`/`EndQuery(heap, type, index)`: an occlusion query marks the
+/// host list between the two, so the draws in between are what it counts.
+pub(crate) extern "win64" fn query_begin(this: This, heap: This, kind: u32, index: u32) {
+    mark(this, heap, kind, index, true);
+}
+
+pub(crate) extern "win64" fn query_end(this: This, heap: This, kind: u32, index: u32) {
+    mark(this, heap, kind, index, false);
+}
+
+fn mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
+    if let Some(list) = host_list(this) {
+        list.mark_query(heap, kind, index, begin);
+    }
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
-extern "win64" fn resolve_queries(
+/// each query's result into the buffer once the list has run. Occlusion
+/// counts and binary occlusion are resolved on the host into a read-back
+/// buffer, so the title reads what its draws actually passed; timestamps
+/// (type 2) are the GPU clock then, and pipeline statistics are zero.
+/// shortcut: no query of the other kinds runs on the host GPU; results
+/// are plausible values, not measured ones (time spans come out as the
+/// submission's length).
+pub(crate) extern "win64" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
+    use crate::query::{BINARY, OCCLUSION};
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
@@ -784,15 +796,27 @@ extern "win64" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    if count == 0
+        || offset
+            .checked_add(u64::from(count) * bytes)
+            .is_none_or(|end| end > size)
+    {
+        return;
+    }
+    if matches!(kind, OCCLUSION | BINARY)
+        && let Some(list) = host_list(this)
+    {
+        // SAFETY: the complete destination range is within the buffer.
+        let dst = unsafe { data.add(offset as usize) };
+        list.resolve_queries(heap, kind, first, count, dst);
         return;
     }
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
+            let what = if piece == 0 { what } else { Written::Value(0) };
             // SAFETY: inside the buffer, checked above.
             let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
-            let what = if piece == 0 { what } else { Written::Value(0) };
             defer_write(this, at as u64, what, 8);
         }
     }
@@ -1023,6 +1047,9 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            if let Some(list) = host_list(this) {
+                list.missed_draw();
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1096,6 +1123,9 @@ extern "win64" fn execute_indirect(
     }
     if ran {
         return;
+    }
+    if let Some(list) = host_list(this) {
+        list.missed_draw();
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -1243,8 +1273,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, query_begin as *const ()),             // 0xe0 BeginQuery
+    (29, query_end as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310

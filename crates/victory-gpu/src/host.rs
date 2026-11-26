@@ -501,6 +501,7 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    queries: crate::query::Recording,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -616,6 +617,7 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let mut completed = true;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -639,11 +641,14 @@ impl Host {
                 match waited {
                     #[cfg(windows)]
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        completed &= WaitForSingleObject(self.event, INFINITE).0 == 0;
                     }
                     #[cfg(not(windows))]
                     Ok(()) => {}
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        completed = false;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -706,7 +711,9 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
+            let mut deferred = list.deferred();
+            deferred.queries.complete(completed);
+            for &(at, what, bytes) in &deferred.writes {
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -996,6 +1003,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.deferred().queries.close(&self.list);
         #[cfg(feature = "diagnostics")]
         if timing() {
             let count = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
@@ -1021,7 +1029,13 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        {
+            let mut deferred = self.deferred();
+            *deferred = Deferred {
+                queries: deferred.queries.reset(),
+                ..Deferred::default()
+            };
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1207,6 +1221,25 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    pub(crate) fn mark_query(&self, heap: crate::object::This, kind: u32, index: u32, begin: bool) {
+        self.deferred().queries.mark(&self.list, heap, kind, index, begin);
+    }
+
+    pub(crate) fn resolve_queries(
+        &self,
+        heap: crate::object::This,
+        kind: u32,
+        first: u32,
+        count: u32,
+        dst: *mut u8,
+    ) {
+        self.deferred().queries.resolve(heap, kind, first, count, dst);
+    }
+
+    pub(crate) fn missed_draw(&self) {
+        self.deferred().queries.missed_draw();
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
@@ -1623,6 +1656,48 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer in the read-back heap, not mapped: what the GPU resolved
+    /// into it is read after the submission that filled it has finished.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(8),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a read-back buffer; nothing maps it
+        // until the submission that resolved into it has finished.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no read-back buffer");
                 None
             }
         }
@@ -2328,6 +2403,114 @@ mod device_tests {
                 .unwrap();
         }
         texture.unwrap()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires a D3D12 device and DXC"]
+    fn overlapping_queries_keep_each_draw_range() {
+        use crate::query::{BINARY, OCCLUSION};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+        let host = host().expect("D3D12 device");
+        let source = r#"
+            [RootSignature("")]
+            float4 vs(uint id : SV_VertexID) : SV_Position {
+                return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
+            }
+            float4 ps() : SV_Target { return 1; }
+        "#;
+        let compile = |entry, profile| {
+            let result = victory_shader::hostlib::compile_hlsl(source, entry, profile);
+            victory_loader::linux::signals::reclaim();
+            result.unwrap()
+        };
+        let vs = compile("vs", "vs_6_0");
+        let ps = compile("ps", "ps_6_0");
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+        formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        let texture = target(host);
+        let list = host.new_list().unwrap();
+        // SAFETY: creation borrows the bytecode and root pointer only for the call.
+        let (root, pipeline): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root = host.device.CreateRootSignature(0, &vs).unwrap();
+            let pipeline = host.device.CreateGraphicsPipelineState(
+                &D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    VS: code(&vs),
+                    PS: code(&ps),
+                    BlendState: blend,
+                    SampleMask: u32::MAX,
+                    RasterizerState: D3D12_RASTERIZER_DESC {
+                        FillMode: D3D12_FILL_MODE_SOLID,
+                        CullMode: D3D12_CULL_MODE_NONE,
+                        DepthClipEnable: true.into(),
+                        ..Default::default()
+                    },
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    RTVFormats: formats,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                },
+            ).unwrap();
+            (root, pipeline)
+        };
+        // SAFETY: the list and the resources it names live through submission.
+        unsafe {
+            list.list.OMSetRenderTargets(1, Some(&host.rtv(&texture, None)), false, None);
+            list.list.SetGraphicsRootSignature(&root);
+            list.list.SetPipelineState(&pipeline);
+            list.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.list.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: 4.0,
+                Height: 4.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+        }
+        let draw = |width| {
+            // SAFETY: a scissor within the 4x4 target and an open list.
+            unsafe {
+                list.list.RSSetScissorRects(&[RECT {
+                    left: 0, top: 0, right: width, bottom: 4,
+                }]);
+                list.list.DrawInstanced(3, 1, 0, 0);
+            }
+        };
+        let counts = crate::query::occlusion_for_test(0, 2).unwrap();
+        let binary = crate::query::occlusion_for_test(0, 2).unwrap();
+        list.mark_query(counts, OCCLUSION, 0, true);
+        draw(4);
+        list.mark_query(binary, BINARY, 0, true);
+        list.mark_query(counts, OCCLUSION, 1, true);
+        draw(1);
+        list.mark_query(counts, OCCLUSION, 0, false);
+        draw(2);
+        list.mark_query(counts, OCCLUSION, 1, false);
+        list.mark_query(binary, BINARY, 0, false);
+        list.mark_query(binary, BINARY, 1, true);
+        draw(4);
+        list.mark_query(binary, BINARY, 1, false);
+
+        let mut counts_result = [u64::MAX; 2];
+        let mut binary_result = [u64::MAX; 2];
+        list.resolve_queries(counts, OCCLUSION, 0, 2, counts_result.as_mut_ptr().cast());
+        list.resolve_queries(binary, BINARY, 0, 2, binary_result.as_mut_ptr().cast());
+        list.close();
+        host.execute(&[&list]);
+        for heap in [counts, binary] {
+            crate::object::slot::<extern "win64" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
+        }
+        assert_eq!(counts_result, [20, 12]);
+        assert_eq!(binary_result, [1, 1]);
     }
 
     /// Records a clear of `texture` (a render target) to `color`.

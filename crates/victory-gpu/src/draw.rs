@@ -595,6 +595,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -848,6 +849,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -935,6 +937,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
