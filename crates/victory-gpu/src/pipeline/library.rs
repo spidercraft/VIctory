@@ -7,7 +7,7 @@
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
 //!    an entry whose description differs, so neither is ever used.
-//! 2. The title pipelines a run drew or dispatched with are listed by a key
+//! 2. The title pipelines a run requested for a draw or dispatch are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
@@ -207,7 +207,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
-/// Title pipeline keys drawn or dispatched with (this run and the last).
+/// Title pipeline keys requested for a draw or dispatch (current and earlier runs).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
@@ -225,13 +225,13 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     used
 }
 
-/// Whether the title pipeline with `key` was drawn with in an earlier run.
+/// Whether `key` was already requested for a draw or dispatch.
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 
-/// The title pipeline with `key` was drawn or dispatched with.
-pub(crate) fn note_used(key: &str) {
+/// The title requested the pipeline with `key` for a draw or dispatch.
+pub(crate) fn note_requested(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
