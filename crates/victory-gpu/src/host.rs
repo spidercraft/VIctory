@@ -1541,8 +1541,9 @@ pub(crate) fn readable(at: *const u8, len: usize) -> bool {
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+/// wrote), leaving pages that are not mapped alone. Returns whether the
+/// entire range was written.
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> bool {
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         #[cfg(windows)]
@@ -1558,15 +1559,17 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         read(from, at as *mut u8, n)
     };
     if len == 0 || write(dst as usize, len) {
-        return;
+        return true;
     }
+    let mut complete = true;
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                complete &= write(at, n);
             });
         }
     });
+    complete
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
